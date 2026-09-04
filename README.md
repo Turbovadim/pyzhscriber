@@ -1,6 +1,8 @@
 # Pyzhscriber
 
-Native macOS dictation built with Rust and GPUI. Hold a shortcut, speak, and release to insert the transcript into the focused app. Speech recognition runs locally through transcribe.cpp with Metal acceleration.
+Pyzhscriber is a fork of [Handy](https://github.com/cjpais/Handy) by CJ Pais and contributors, adapted into a native macOS app built with Rust and GPUI. Hold a shortcut, speak, and release to insert the transcript into the focused app.
+
+Speech recognition runs locally through Handy's [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp) layer with Metal acceleration. This project builds on Handy's work, including its model catalog and distribution infrastructure. The vendored transcribe.cpp Rust bindings and native code include local patches described in [vendor/README.md](vendor/README.md).
 
 This is a developer preview. Build from source; there are no release binaries or CI workflows. The current build targets macOS with Apple Silicon. Other platforms are not supported by this setup.
 
@@ -107,4 +109,4 @@ See [vendor/README.md](vendor/README.md) for the native patches and their proven
 
 ## License
 
-Pyzhscriber is licensed under [MIT](LICENSE). Vendored dependencies retain their own licenses, including the Apache-2.0 GPUI platform code. Model weights have their own licenses and are downloaded separately.
+Pyzhscriber is licensed under [MIT](LICENSE), with Handy's original copyright notice preserved. Vendored dependencies retain their own licenses, including the Apache-2.0 GPUI platform code. Model weights have their own licenses and are downloaded separately.

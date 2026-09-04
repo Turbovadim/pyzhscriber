@@ -4,6 +4,8 @@ Keep these directories in the repository. The root `Cargo.toml` uses them throug
 
 ## transcribe.cpp
 
+[transcribe.cpp](https://github.com/handy-computer/transcribe.cpp) is Handy's speech recognition layer. Pyzhscriber uses its Rust bindings and native implementation for local inference. Credit belongs to the Handy and transcribe.cpp authors; their MIT notices are preserved in the vendored license files.
+
 `transcribe-cpp/` and `transcribe-cpp-sys/` contain the published 0.2.2 crates with a local extension that restricts Whisper automatic language detection to an explicit set of language codes. Native sources, GGML, and their license files are included.
 
 ## GPUI macOS platform
