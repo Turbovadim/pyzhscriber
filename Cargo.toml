@@ -1,0 +1,72 @@
+[package]
+name = "pyzhscriber"
+version = "0.1.0"
+edition = "2024"
+authors = ["Vadim Yolkin"]
+description = "A native GPUI speech-to-text app for Russian and English"
+license = "MIT"
+build = "build.rs"
+
+[features]
+visual-qa = ["gpui/test-support", "gpui_platform/test-support"]
+
+[[bin]]
+name = "pyzhscriber-visual-qa"
+path = "src/bin/visual_qa.rs"
+required-features = ["visual-qa"]
+
+[dependencies]
+anyhow = "1"
+arboard = "3.6"
+async-channel = "2"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+cpal = "0.16"
+dirs = "6"
+enigo = "0.6.1"
+futures-util = "0.3"
+gpui = { git = "https://github.com/zed-industries/zed", rev = "fecc3273ed32643c2ea1b04a74c8780e2c9ffaf8", default-features = false, features = ["default"] }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "fecc3273ed32643c2ea1b04a74c8780e2c9ffaf8", features = ["font-kit", "wayland", "x11"] }
+gpui_tokio = { git = "https://github.com/zed-industries/zed", rev = "fecc3273ed32643c2ea1b04a74c8780e2c9ffaf8" }
+hound = "3.5"
+image = "0.25"
+log = "0.4"
+parking_lot = "0.12"
+raw-window-handle = "0.6"
+reqwest = { version = "0.12", features = ["blocking", "json", "stream"] }
+rodio = { git = "https://github.com/cjpais/rodio.git" }
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+single-instance = "0.3"
+smol = "2"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "rt-multi-thread", "time"] }
+transcribe-cpp = { version = "0.2.0", default-features = false, features = ["metal"] }
+tray-icon = "0.21"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSAlert", "NSApplication", "NSButton", "NSControl", "NSImage", "NSWindow", "NSView", "NSResponder", "NSEvent", "NSPasteboard", "NSStatusBar", "NSStatusBarButton", "NSStatusItem", "NSTextField", "NSWorkspace", "NSRunningApplication"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSProcessInfo", "NSString", "NSURL", "NSNotification", "NSObject"] }
+
+[patch.crates-io]
+# Keep the language-token constraint next to the native implementation until it
+# lands upstream in transcribe.cpp.
+transcribe-cpp = { path = "vendor/transcribe-cpp" }
+transcribe-cpp-sys = { path = "vendor/transcribe-cpp-sys" }
+
+[patch."https://github.com/zed-industries/zed"]
+# Release per-window Metal drawables and render targets after macOS reports
+# that a window has remained fully occluded for two seconds.
+gpui_apple = { path = "vendor/zed-gpui-occlusion/crates/gpui_apple" }
+gpui_macos = { path = "vendor/zed-gpui-occlusion/crates/gpui_macos" }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

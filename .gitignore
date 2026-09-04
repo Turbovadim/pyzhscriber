@@ -1,0 +1,27 @@
+# Build output and local QA
+/target/
+/dist/
+/artifacts/
+/design-qa.md
+**/target/
+
+# Editor and OS files
+/.idea/
+/.vscode/
+.DS_Store
+
+# Local configuration, credentials, and runtime data
+.env
+.env.*
+!.env.example
+*.log
+*.pem
+*.key
+*.p12
+*.pfx
+/settings.json
+/history.db*
+/recordings/
+/models/
+*.gguf
+*.mlmodelc/
