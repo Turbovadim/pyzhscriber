@@ -319,6 +319,11 @@ ggml_tensor * conv_module(ggml_context * ctx, ggml_tensor * x, const BlockView &
     // B == 1 for single-shot; the offline batched encoder passes B > 1.
     const int64_t B       = x->ne[2];
 
+    const bool channel_dw = policy.direct_dw_channel_contiguous && policy.direct_pw && policy.direct_dw_in_block &&
+                            pad_left == pad_right && params.conv_pad_mask == nullptr &&
+                            params.streaming_time_in == nullptr && params.streaming_time_out == nullptr;
+    ggml_tensor * channel_dw_input = nullptr;
+
     if (policy.direct_pw) {
         // Pointwise conv 1 as direct mul_mat in [d_model, T, B] layout.
         // Kernel ne=[1, d_model, 2*d_model] → reshape to [d_model, 2*d_model].
@@ -347,8 +352,18 @@ ggml_tensor * conv_module(ggml_context * ctx, ggml_tensor * x, const BlockView &
         }
         // x ne = [d_model, T, B]
 
-        // Transpose for depthwise conv: [d_model, T, B] -> [T, d_model, B].
-        x = ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3));
+        if (channel_dw) {
+            // [D,T,B] -> [D,1,T,B] -> [T,1,D,B], with adjacent channels.
+            // This selects Metal's channel-tiled depthwise kernel and skips
+            // the input transpose copy. Other padding/layouts keep the copy.
+            // The singleton height keeps nb[1] == nb[0], so GGML currently
+            // leaves the output in its ordinary time-contiguous layout.
+            channel_dw_input = ggml_permute(ctx, ggml_reshape_4d(ctx, x, d_model, 1, x->ne[1], B), 2, 1, 0, 3);
+        }
+        x = ggml_permute(ctx, x, 1, 0, 2, 3);
+        if (!channel_dw) {
+            x = ggml_cont(ctx, x);
+        }
     } else {
         // Fallback: im2col path in [T, d_model] layout.
         x = ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3));
@@ -438,11 +453,15 @@ ggml_tensor * conv_module(ggml_context * ctx, ggml_tensor * x, const BlockView &
         // ggml_conv_2d_dw_direct which expects [W, H, C, N] (N == B, the
         // utterance batch). Kernel [k, 1, d_model] → [k, 1, 1, d_model].
         ggml_tensor * knl  = ggml_reshape_4d(ctx, dw_kernel_for_direct(ctx, b.conv_dw_w), conv_kernel, 1, 1, d_model);
-        ggml_tensor * data = ggml_reshape_4d(ctx, x, x->ne[0], 1, x->ne[1], B);
+        ggml_tensor * data = channel_dw_input != nullptr ? channel_dw_input
+                                                        : ggml_reshape_4d(ctx, x, x->ne[0], 1, x->ne[1], B);
         x                  = ggml_conv_2d_dw_direct(ctx, knl, data,
                                                     /*s0=*/1, /*s1=*/1,
                                                     /*p0=*/padding_op, /*p1=*/0,
                                                     /*d0=*/1, /*d1=*/1);
+        if (!ggml_is_contiguous(x)) {
+            x = ggml_cont(ctx, x);
+        }
         // Output: [T_out, 1, d_model, B] → [T_out, d_model, B].
         x                  = ggml_reshape_3d(ctx, x, x->ne[0], x->ne[2], x->ne[3]);
     } else {
@@ -496,6 +515,16 @@ ggml_tensor * conv_module(ggml_context * ctx, ggml_tensor * x, const BlockView &
     }
 
     return x;
+}
+
+ggml_tensor * rel_shift_view(ggml_context * ctx, ggml_tensor * x, int64_t n_kv) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(x));
+    GGML_ASSERT(n_kv > 0 && x->ne[0] == x->ne[1] + n_kv - 1);
+    // out[k,q] = x[k-q+T_q-1,q]. Each query starts one element
+    // earlier within its original row; head and batch offsets stay intact.
+    const size_t row_stride = x->ne[1] > 1 ? x->nb[1] - x->nb[0] : x->nb[1];
+    return ggml_view_4d(ctx, x, n_kv, x->ne[1], x->ne[2], x->ne[3],
+                        row_stride, x->nb[2], x->nb[3], (x->ne[1] - 1) * x->nb[0]);
 }
 
 // Relative-position multi-head self-attention.
@@ -599,13 +628,11 @@ ggml_tensor * rel_pos_mhsa(ggml_context *      ctx,
     ggml_tensor * q_u = ggml_add(ctx, q, b.attn_pos_u);
     ggml_tensor * q_v = ggml_add(ctx, q, b.attn_pos_v);
 
-    // All of Q, K, V need [head_dim, T, n_head, B] for the attention. The
-    // permute is a zero-cost view (no data copy). flash_attn_ext accesses
-    // data via strides, so contiguous materialization (cont) is not
-    // required for q_u/k/v. q_v and p still need cont because they feed
-    // into mul_mat for the position score computation.
+    // Attention and the position-score matmul consume these head/row
+    // strides directly. Keep the permutes as views instead of copying
+    // every head into a separate contiguous matrix.
     q_u = ggml_permute(ctx, q_u, 0, 2, 1, 3);
-    q_v = ggml_cont(ctx, ggml_permute(ctx, q_v, 0, 2, 1, 3));
+    q_v = ggml_permute(ctx, q_v, 0, 2, 1, 3);
 
     k = ggml_reshape_4d(ctx, k, head_dim, n_head, T_kv, B);
     k = ggml_permute(ctx, k, 0, 2, 1, 3);
@@ -618,7 +645,7 @@ ggml_tensor * rel_pos_mhsa(ggml_context *      ctx,
     // The precomputed pos_proj is exactly this tensor, memoized.
     if (p != nullptr) {
         p = ggml_reshape_4d(ctx, p, head_dim, n_head, pos_len, 1);
-        p = ggml_cont(ctx, ggml_permute(ctx, p, 0, 2, 1, 3));
+        p = ggml_permute(ctx, p, 0, 2, 1, 3);
     } else {
         p = pos_proj;
     }
@@ -662,21 +689,14 @@ ggml_tensor * rel_pos_mhsa(ggml_context *      ctx,
         }
     }
 
-    // rel_shift generalizes to the rectangular case: with input
-    // [T_q + T_kv - 1, T_q] it yields out[k, q] = in[k - q + T_q - 1, q],
-    // i.e. row k holds the score of key k against query q for relative
-    // offset (T_kv - 1) - (k - q + T_q - 1) = (T_kv - T_q) + q - k —
-    // exactly the query-at-absolute-position (T_kv - T_q + q) semantics
-    // the streaming x_q path needs. The square offline case is the
-    // T_q == T_kv specialization. The zero column injected by the trick
-    // only lands at k >= T_kv, which the view below slices off.
-    matrix_bd = rel_shift(ctx, matrix_bd);
-    matrix_bd = ggml_view_4d(ctx, matrix_bd, T_kv, T_q, n_head, B, matrix_bd->nb[1], matrix_bd->nb[2], matrix_bd->nb[3],
-                             /*offset=*/0);
-    // The view is non-contiguous (nb[1] stays at parent's
-    // pos_len*es), but it IS contiguous-rows. The flash path calls
-    // ggml_scale which wants full contiguity, so cont there. The
-    // manual path only feeds matrix_bd into ggml_add(kq, matrix_bd),
+    // Read the retained part of rel_shift directly from the score matrix.
+    // out[k,q] = in[k-q+T_q-1,q] also covers streaming's rectangular case:
+    // query q has absolute position T_kv-T_q+q. The old zero padding only
+    // affected discarded keys at k >= T_kv.
+    matrix_bd = rel_shift_view(ctx, matrix_bd, T_kv);
+    // The skewed view is non-contiguous, but has contiguous rows.
+    // Flash needs full contiguity for ggml_scale, so copy the cropped result.
+    // The manual path only feeds matrix_bd into ggml_add(kq, matrix_bd),
     // which handles contiguous-rows inputs on both CPU and Metal.
     if (flash) {
         matrix_bd = ggml_cont(ctx, matrix_bd);

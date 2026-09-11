@@ -2,6 +2,8 @@
 
 Implemented September 11, 2026. Baseline: `3ce6e1e12e9a1a8bf7a1e720dbee076be756f9ac`.
 
+This report covers the changes committed as `3b34cb4`. See the [encoder follow-up](canary-encoder-performance.md) for subsequent speed measurements and validation.
+
 The changes target standard Canary on Metal, tested with the installed Canary 1B v2 Q5_K_M model. The main measured improvement is process memory. Warm transcription latency remains close to the baseline. See the [earlier investigation](canary-optimization-investigation.md) for the other paths considered.
 
 ## Changes

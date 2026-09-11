@@ -106,6 +106,7 @@ EncoderBuild build_encoder_graph(ggml_context *        ctx,
     const bool direct_dw           = detect_direct_dw_in_block(backend_name);
     policy.direct_dw_in_block      = direct_dw;
     policy.direct_dw_in_pre_encode = false;  // parakeet-style: im2col here
+    policy.direct_dw_channel_contiguous = backend_name != nullptr && std::strncmp(backend_name, "MTL", 3) == 0;
 
     EncoderBuild eb{};
 

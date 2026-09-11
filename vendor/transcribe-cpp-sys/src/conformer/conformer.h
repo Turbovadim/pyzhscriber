@@ -121,6 +121,9 @@ struct ConvPolicy {
     // path, and shifts both the freq and time output dims. False on every
     // offline variant; true on nemotron-speech-streaming-en.
     bool causal_pre_encode = false;
+
+    // Let Metal's depthwise kernel read contiguous channels after the GLU.
+    bool direct_dw_channel_contiguous = false;
 };
 
 // Resolve a conv-dispatch toggle from its env overrides. The DIRECT var forces
@@ -285,6 +288,9 @@ ggml_tensor * macaron_ff_residual(ggml_context * ctx,
 // [pos_len, T_q, H, 1] score matrix into a [pos_len, T_q, H, 1]
 // matrix rotated so column k holds the score for relative offset k.
 ggml_tensor * rel_shift(ggml_context * ctx, ggml_tensor * x);
+
+// Crop the relative-position skew to its valid keys without copying scores.
+ggml_tensor * rel_shift_view(ggml_context * ctx, ggml_tensor * x, int64_t n_kv);
 
 // f32-friendly Conv1D. Use instead of ggml_conv_1d for fp32 kernels on
 // Metal (see conv_2d_dw_f32 in conformer.cpp).

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run native loading/mapping checks and optional bitwise mel comparison on macOS.
+"""Run native loading, mapping, Conformer and optional mel checks on macOS.
 
 Pass the transcribe-cpp-sys Cargo OUT_DIR containing lib/transcribe-link.json.
 The optional baseline source is an unchanged transcribe-cpp-sys directory.
@@ -51,6 +51,15 @@ def main():
             )
             for mode in ["cpu", "metal-shared", "metal-private"]:
                 subprocess.run([str(executable), mode], check=True)
+
+        conformer = work / "conformer"
+        subprocess.run(
+            compiler + includes + [str(root / "tests/canary-native/conformer.cpp"),
+                                   "-o", str(conformer)] + libraries,
+            check=True,
+        )
+        for mode in ["cpu", "metal-shared", "metal-private"]:
+            subprocess.run([str(conformer), mode], check=True)
 
         if args.baseline_source:
             baseline = args.baseline_source.resolve()
