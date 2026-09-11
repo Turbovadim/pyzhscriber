@@ -179,6 +179,94 @@ bool compare_frame_major_padding() {
     return true;
 }
 
+bool compare_pow2_frontend() {
+    struct Case { std::vector<float> pcm; size_t min_samples = 0; };
+    std::vector<Case> cases;
+    for (size_t length : {size_t(160), size_t(256), size_t(257), size_t(399), size_t(400), size_t(479),
+                          size_t(480), size_t(511), size_t(512), size_t(559), size_t(560), size_t(561),
+                          size_t(16001), size_t(257)}) {
+        cases.push_back({waveform(length, length)});
+    }
+    cases.push_back({{0.625f}, 640});
+    cases.push_back({waveform(257, 257), 800});
+    cases.push_back({std::vector<float>(1024, -0.0f)});
+    cases.push_back({waveform(1024, 641, std::numeric_limits<float>::denorm_min())});
+    auto nonfinite = waveform(1024, 1024);
+    nonfinite[0] = std::numeric_limits<float>::infinity();
+    nonfinite[512] = std::numeric_limits<float>::quiet_NaN();
+    cases.push_back({nonfinite});
+    cases.push_back({waveform(640, 320)});
+
+    for (const char * padding : {"reflect", "constant", "none"}) {
+        for (float emphasis : {0.97f, 0.0f}) {
+            transcribe::MelConfig cfg;
+            cfg.pad_mode = padding;
+            cfg.pre_emphasis = emphasis;
+            auto baseline = std::unique_ptr<void, decltype(&mel_baseline_destroy)>(
+                mel_baseline_create(&cfg), &mel_baseline_destroy);
+            transcribe::MelFrontend candidate(cfg);
+            for (auto layout : {transcribe::MelLayout::ChannelMajor, transcribe::MelLayout::FrameMajor}) {
+                std::vector<float> expected, actual;
+                int expected_mels = 0, expected_frames = 0, actual_mels = 0, actual_frames = 0;
+                auto matches = [&] {
+                    if (expected_mels != actual_mels || expected_frames != actual_frames ||
+                        expected.size() != actual.size()) return false;
+                    for (int m = 0; m < actual_mels; ++m) {
+                        for (int t = 0; t < actual_frames; ++t) {
+                            const size_t reference = static_cast<size_t>(m) * actual_frames + t;
+                            const size_t output = layout == transcribe::MelLayout::ChannelMajor ? reference :
+                                static_cast<size_t>(t) * actual_mels + m;
+                            if (std::memcmp(&expected[reference], &actual[output], sizeof(float))) return false;
+                        }
+                    }
+                    return true;
+                };
+                for (size_t index = 0; index < cases.size(); ++index) {
+                    const auto & item = cases[index];
+                    auto padded = item.pcm;
+                    padded.resize(std::max(padded.size(), item.min_samples), 0.0f);
+                    const int threads = index % 2 ? 1 : 4;
+                    const auto before = mel_baseline_compute(baseline.get(), padded.data(), padded.size(), &expected,
+                                                             &expected_mels, &expected_frames, threads);
+                    const auto after = candidate.compute(item.pcm.data(), item.pcm.size(), actual, actual_mels,
+                                                          actual_frames, threads, layout, item.min_samples);
+                    if (before != after || !matches()) {
+                        std::fprintf(stderr, "FAIL pow2_sequence pad=%s emphasis=%g layout=%d case=%zu\n",
+                                     padding, emphasis, static_cast<int>(layout), index);
+                        return false;
+                    }
+                }
+                // Shrinking and growing outputs may alias PCM, including an
+                // interior pointer. All input reads must precede output resize.
+                for (size_t length : {size_t(480), size_t(16001)}) {
+                    for (size_t offset : {size_t(0), size_t(17)}) {
+                        actual = waveform(length + offset, length + offset);
+                        const auto before = mel_baseline_compute(baseline.get(), actual.data() + offset, length,
+                                                                 &expected, &expected_mels, &expected_frames, 4);
+                        const auto after = candidate.compute(actual.data() + offset, length, actual, actual_mels,
+                                                              actual_frames, 4, layout);
+                        if (before != TRANSCRIBE_OK || before != after || !matches()) {
+                            std::fprintf(stderr, "FAIL pow2_alias pad=%s emphasis=%g layout=%d length=%zu offset=%zu\n",
+                                         padding, emphasis, static_cast<int>(layout), length, offset);
+                            return false;
+                        }
+                    }
+                }
+                std::printf("PASS pow2_sequence pad=%s emphasis=%g layout=%d cases=%zu aliases=4\n",
+                            padding, emphasis, static_cast<int>(layout), cases.size());
+            }
+        }
+    }
+    // The FP64 padding change also serves frontends without per-feature
+    // normalization; keep their existing output and frame-mask behavior.
+    for (const char * normalization : {"none", "global", "per_utterance"}) {
+        transcribe::MelConfig cfg;
+        cfg.normalize = normalization;
+        if (!compare((std::string("pow2_") + normalization).c_str(), cfg, waveform(4096, 2049), 4)) return false;
+    }
+    return true;
+}
+
 int main(int argc, char ** argv) {
     const bool bench = argc > 1 && std::string(argv[1]) == "--bench";
     const bool full = argc > 1 && std::string(argv[1]) == "--full";
@@ -240,6 +328,7 @@ int main(int argc, char ** argv) {
     nonfinite.window[100] = std::numeric_limits<float>::infinity();
     okay &= compare("nonfinite_window", nonfinite, std::vector<float>(2048), 1);
     okay &= compare_frame_major_padding();
+    okay &= compare_pow2_frontend();
     if (full) {
         for (int threads : {1, 8}) {
             okay &= compare("30sec_short_signal", cfg, waveform(480000, 25341), threads);
@@ -248,7 +337,7 @@ int main(int argc, char ** argv) {
             okay &= compare("65sec_continuous_signal", cfg, waveform(1040000, 1040000), threads);
         }
         transcribe::MelConfig pow2;
-        okay &= compare("pow2_unchanged", pow2, waveform(16000, 9371), 1);
+        okay &= compare("pow2_long_signal", pow2, waveform(1040000, 735111), 8);
     }
     return okay ? 0 : 1;
 }

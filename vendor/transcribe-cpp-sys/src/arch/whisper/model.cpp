@@ -210,9 +210,9 @@ static transcribe_status ensure_gguf_encoder_fallback(WhisperModel * model) {
     }
 
     ggml_backend_buffer_t encoder_buffer = nullptr;
-    std::unique_ptr<WeightMapping> encoder_mapping;
-    const bool mapped_encoder = try_map_weights(model->coreml_fallback_path, gguf_data, encoder_ctx,
-                                                model->plan.primary, encoder_buffer, encoder_mapping);
+    std::unique_ptr<load_common::WeightMapping> encoder_mapping;
+    const bool mapped_encoder = load_common::try_map_weights(model->coreml_fallback_path, gguf_data, encoder_ctx,
+                                                             model->plan.primary, encoder_buffer, encoder_mapping);
     transcribe_status stream_status = TRANSCRIBE_OK;
     if (!mapped_encoder) {
         encoder_buffer = ggml_backend_alloc_ctx_tensors(encoder_ctx, model->plan.primary);
@@ -715,8 +715,8 @@ transcribe_status whisper_load(Loader & loader, const transcribe_model_load_para
     }
 #endif
 
-    const bool mapped_weights = try_map_weights(loader.path(), gguf_data, m->ctx_meta, m->plan.primary,
-                                                m->backend_buffer, m->weight_mapping);
+    const bool mapped_weights = load_common::try_map_weights(loader.path(), gguf_data, m->ctx_meta, m->plan.primary,
+                                                             m->backend_buffer, m->weight_mapping);
     if (mapped_weights) {
         log_msg(TRANSCRIBE_LOG_LEVEL_INFO, "whisper: mapped %.1f MiB read-only GGUF weights",
                 static_cast<double>(m->weight_mapping->size) / (1024.0 * 1024.0));

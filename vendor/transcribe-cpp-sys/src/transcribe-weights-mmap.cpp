@@ -1,4 +1,4 @@
-#include "weights-mmap.h"
+#include "transcribe-weights-mmap.h"
 
 #include "ggml.h"
 #include "gguf.h"
@@ -24,7 +24,7 @@
 #endif
 #endif
 
-namespace transcribe::whisper {
+namespace transcribe::load_common {
 
 WeightMapping::~WeightMapping() {
 #if defined(__APPLE__) && TARGET_OS_OSX
@@ -182,4 +182,4 @@ bool try_map_weights(const std::string & path, const gguf_context * gguf,
 #endif
 }
 
-}  // namespace transcribe::whisper
+}  // namespace transcribe::load_common

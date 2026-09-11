@@ -22,9 +22,7 @@ struct DecoderDumps {
     ggml_tensor * token_emb       = nullptr;
     ggml_tensor * pos_emb         = nullptr;
     ggml_tensor * embed_norm      = nullptr;
-    // For canary's per-sublayer dumps: indexed by layer, three slots each.
-    // Slot 0 = post self_attn residual, slot 1 = post cross_attn residual,
-    // slot 2 = post ffn residual (i.e. block out).
+    // Sublayer outputs before their residual additions, indexed by layer.
     ggml_tensor * sub_self[64]    = {};
     ggml_tensor * sub_cross[64]   = {};
     ggml_tensor * sub_ffn[64]     = {};
@@ -38,8 +36,8 @@ struct DecoderBuild {
     ggml_tensor * pos_ids_in     = nullptr;
     ggml_tensor * encoder_out_in = nullptr;
 
-    ggml_tensor * out        = nullptr;  // logits [vocab, seq]
-    ggml_tensor * argmax_out = nullptr;  // [seq] i32 when skip_log_softmax
+    ggml_tensor * out        = nullptr;  // logits [vocab, seq], or [vocab, 1] for non-debug greedy decode
+    ggml_tensor * argmax_out = nullptr;  // [1] i32 when skip_log_softmax
 
     DecoderDumps  dumps{};
     ggml_cgraph * graph = nullptr;
@@ -57,9 +55,10 @@ DecoderBuild build_cross_kv_graph(ggml_context *        ctx,
 // Build a decoder graph that uses the KV cache. Works for both prompt
 // pass (n_tokens > 1, n_past == 0) and step pass (n_tokens == 1).
 //
-// skip_log_softmax: when true, skip the log-softmax tail and add a GPU
+// skip_log_softmax: when true, skip the log-softmax tail and add a backend
 // argmax over the last new-token position (saves a vocab-wide softmax
-// per step). The pre-softmax logits remain available via dumps.logits_raw.
+// per step). Outside debugging, only that position is projected through the
+// vocabulary head. The resulting logits remain available via dumps.logits_raw.
 DecoderBuild build_decoder_graph_kv(ggml_context *        ctx,
                                     const CanaryWeights & w,
                                     const CanaryHParams & hp,

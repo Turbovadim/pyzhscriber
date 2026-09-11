@@ -41,7 +41,6 @@ def main():
     with tempfile.TemporaryDirectory(prefix="pyzhscriber-native-tests-") as directory:
         work = Path(directory)
         mapping_includes = includes + [
-            "-I" + str(source / "src/arch/whisper"),
             "-I" + str(source / "ggml/src"),
         ]
         for name, test_includes in [("loader", includes), ("mmap", mapping_includes)]:

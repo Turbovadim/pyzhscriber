@@ -13,6 +13,7 @@
 #include "transcribe-model.h"
 #include "transcribe-session.h"
 #include "transcribe-tokenizer.h"
+#include "transcribe-weights-mmap.h"
 #include "weights.h"
 
 #include <cstdint>
@@ -105,6 +106,7 @@ struct CanaryModel final : public transcribe_model {
 
     transcribe::BackendPlan plan;
     ggml_backend_buffer_t   backend_buffer = nullptr;
+    std::unique_ptr<load_common::WeightMapping> weight_mapping;
 
     // Fused BN parameters (same as parakeet/cohere).
     ggml_context *        bn_fused_ctx    = nullptr;

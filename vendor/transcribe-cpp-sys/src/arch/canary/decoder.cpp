@@ -379,19 +379,19 @@ DecoderBuild build_decoder_graph_kv(ggml_context *        ctx,
 
     ggml_tensor * tok_emb = ggml_get_rows(ctx, w.dec_embed.token_w, db.token_ids_in);
     tok_emb               = named(tok_emb, "dec.token_emb");
-    ggml_set_output(tok_emb);
+    transcribe::debug::mark_tensor_for_dump(tok_emb);
     db.dumps.token_emb = tok_emb;
 
     ggml_tensor * pos_emb = ggml_get_rows(ctx, w.dec_embed.pos_enc, db.pos_ids_in);
     pos_emb               = named(pos_emb, "dec.pos_emb");
-    ggml_set_output(pos_emb);
+    transcribe::debug::mark_tensor_for_dump(pos_emb);
     db.dumps.pos_emb = pos_emb;
 
     // Embedding layer norm: NeMo applies it AFTER tok+pos sum.
     ggml_tensor * x = ggml_add(ctx, tok_emb, pos_emb);
     x               = layer_norm(ctx, x, w.dec_embed.norm_w, w.dec_embed.norm_b);
     x               = named(x, "dec.embed_norm");
-    ggml_set_output(x);
+    transcribe::debug::mark_tensor_for_dump(x);
     db.dumps.embed_norm = x;
 
     // Causal mask for self-attention. Shape: [n_kv, n_tokens].
@@ -425,7 +425,7 @@ DecoderBuild build_decoder_graph_kv(ggml_context *        ctx,
                 char bname[64];
                 std::snprintf(bname, sizeof(bname), "dec.layer.%d.self_attn.out", i);
                 self_out = named(self_out, bname);
-                ggml_set_output(self_out);
+                transcribe::debug::mark_tensor_for_dump(self_out);
                 db.dumps.sub_self[i] = self_out;
             }
             x = ggml_add(ctx, x, self_out);
@@ -441,7 +441,7 @@ DecoderBuild build_decoder_graph_kv(ggml_context *        ctx,
                 char bname[64];
                 std::snprintf(bname, sizeof(bname), "dec.layer.%d.cross_attn.out", i);
                 cross_out = named(cross_out, bname);
-                ggml_set_output(cross_out);
+                transcribe::debug::mark_tensor_for_dump(cross_out);
                 db.dumps.sub_cross[i] = cross_out;
             }
             x = ggml_add(ctx, x, cross_out);
@@ -467,7 +467,7 @@ DecoderBuild build_decoder_graph_kv(ggml_context *        ctx,
                 char bname[64];
                 std::snprintf(bname, sizeof(bname), "dec.layer.%d.ffn.out", i);
                 ff = named(ff, bname);
-                ggml_set_output(ff);
+                transcribe::debug::mark_tensor_for_dump(ff);
                 db.dumps.sub_ffn[i] = ff;
             }
             x = ggml_add(ctx, x, ff);
@@ -479,14 +479,21 @@ DecoderBuild build_decoder_graph_kv(ggml_context *        ctx,
     x                        = named(x, "dec.out_before_head");
     db.dumps.out_before_head = x;
 
+    // All prompt positions have populated self-KV; only the final position
+    // predicts the next token. Debug runs retain the full vocabulary output.
+    ggml_tensor * head_input = x;
+    if (skip_log_softmax && !transcribe::debug::enabled() && n_tokens > 1) {
+        head_input = ggml_view_2d(ctx, x, hidden, 1, x->nb[1], x->nb[1] * static_cast<size_t>(n_tokens - 1));
+    }
+
     // Untied LM head.
-    ggml_tensor * logits = ggml_mul_mat(ctx, w.head.weight, x);
+    ggml_tensor * logits = ggml_mul_mat(ctx, w.head.weight, head_input);
     if (w.head.bias != nullptr) {
         logits = ggml_add(ctx, logits, w.head.bias);
     }
 
     logits = named(logits, "dec.logits_raw");
-    ggml_set_output(logits);
+    transcribe::debug::mark_tensor_for_dump(logits);
     db.dumps.logits_raw = logits;
 
     if (!skip_log_softmax) {
@@ -500,10 +507,11 @@ DecoderBuild build_decoder_graph_kv(ggml_context *        ctx,
 
     if (skip_log_softmax) {
         ggml_tensor * last_logits = logits;
-        if (n_tokens > 1) {
+        if (logits->ne[1] > 1) {
             const int64_t vocab     = logits->ne[0];
             const size_t  row_bytes = ggml_element_size(logits) * vocab;
-            last_logits             = ggml_view_2d(ctx, logits, vocab, /*n=*/1, row_bytes, row_bytes * (n_tokens - 1));
+            last_logits             = ggml_view_2d(ctx, logits, vocab, /*n=*/1, row_bytes,
+                                                  row_bytes * static_cast<size_t>(logits->ne[1] - 1));
             last_logits             = ggml_cont(ctx, last_logits);
         }
         db.argmax_out = ggml_argmax(ctx, last_logits);

@@ -439,9 +439,13 @@ transcribe_status MelFrontend::compute(const float *        pcm,
             window_f32[i] = static_cast<float>(window_[i]);
         }
     } else {
-        // FP64 path (Parakeet, Cohere): unchanged. emph buffer + fp64
-        // padded, identical to the original implementation.
-        std::vector<double> emph(n_samples);
+        // Write FP64 pre-emphasis into the final padded buffer. Keep the
+        // same arithmetic and reflect the emphasized samples afterwards.
+        // With center=False, trailing window zeros may read n_fft-win
+        // samples beyond the input, so retain that extra initialized space.
+        const size_t input_offset = no_pad ? 0 : static_cast<size_t>(pad);
+        padded.resize(n_samples + (no_pad ? static_cast<size_t>(n_fft - win) : 2 * input_offset));
+        double * emph = padded.data() + input_offset;
         if (cfg_.pre_emphasis != 0.0f) {
             const double alpha = static_cast<double>(cfg_.pre_emphasis);
             emph[0]            = static_cast<double>(pcm[0]);
@@ -458,28 +462,12 @@ transcribe_status MelFrontend::compute(const float *        pcm,
             }
         }
 
-        if (no_pad) {
-            // PyTorch center=False: no input padding. Sized so that the
-            // last frame (start=(n_frames-1)*hop) can read n_fft samples
-            // without overflowing. The trailing (n_fft - win_length) slots
-            // beyond the data are read but always multiplied by zero in
-            // the left-aligned window, so their value is irrelevant.
-            padded.resize(n_samples + static_cast<size_t>(n_fft - win), 0.0);
-            std::memcpy(padded.data(), emph.data(), n_samples * sizeof(double));
-        } else {
-            padded.resize(n_samples + 2 * static_cast<size_t>(pad));
-            if (use_reflect) {
-                for (int i = 0; i < pad; ++i) {
-                    padded[i] = emph[static_cast<size_t>(pad - i)];
-                }
-                std::memcpy(padded.data() + pad, emph.data(), n_samples * sizeof(double));
-                for (int i = 0; i < pad; ++i) {
-                    padded[static_cast<size_t>(pad) + n_samples + i] = emph[n_samples - 2 - static_cast<size_t>(i)];
-                }
-            } else {
-                std::memset(padded.data(), 0, static_cast<size_t>(pad) * sizeof(double));
-                std::memcpy(padded.data() + pad, emph.data(), n_samples * sizeof(double));
-                std::memset(padded.data() + pad + n_samples, 0, static_cast<size_t>(pad) * sizeof(double));
+        if (use_reflect) {
+            for (int i = 0; i < pad; ++i) {
+                padded[i] = emph[static_cast<size_t>(pad - i)];
+            }
+            for (int i = 0; i < pad; ++i) {
+                padded[input_offset + n_samples + i] = emph[n_samples - 2 - static_cast<size_t>(i)];
             }
         }
     }
@@ -504,13 +492,17 @@ transcribe_status MelFrontend::compute(const float *        pcm,
     const bool whisper_mode = (cfg_.normalize == "per_utterance" || cfg_.normalize == "global");
     const bool frame_major = layout == MelLayout::FrameMajor;
     const bool direct_output = frame_major && !n_fft_is_pow2 && whisper_mode;
+    // Per-feature statistics read a complete row before normalizing it,
+    // so channel-major output can hold raw and normalized mel in place.
+    // PCM has already been copied above for these configurations.
+    const bool in_place_normalize = !frame_major && cfg_.normalize == "per_feature";
     // These normalization modes discard the last centered STFT frame.
     const int computed_frames = direct_output ? n_frames - 1 : n_frames;
     if (computed_frames <= 0) {
         return TRANSCRIBE_ERR_INVALID_ARG;
     }
     std::vector<float> log_mel_storage;
-    std::vector<float> & log_mel = direct_output ? out_mel : log_mel_storage;
+    std::vector<float> & log_mel = (direct_output || in_place_normalize) ? out_mel : log_mel_storage;
     log_mel.resize(static_cast<size_t>(n_mels) * static_cast<size_t>(computed_frames));
 
     int stft_threads = n_threads;

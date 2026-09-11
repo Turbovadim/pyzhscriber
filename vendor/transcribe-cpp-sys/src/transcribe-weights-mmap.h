@@ -8,7 +8,7 @@
 
 struct gguf_context;
 
-namespace transcribe::whisper {
+namespace transcribe::load_common {
 
 // Non-owning backend buffers must be released before this mapping is destroyed.
 struct WeightMapping {
@@ -21,7 +21,7 @@ struct WeightMapping {
     ~WeightMapping();
 };
 
-// Bind an unallocated Whisper weight context directly to an immutable GGUF file.
+// Bind an unallocated weight context directly to an immutable GGUF file.
 // The file must not be modified in place while mapped; unlink/rename is safe.
 // Failure leaves tensors and outputs untouched so the caller can stream them.
 // The caller owns both outputs and must free buffer before destroying mapping.
@@ -30,4 +30,4 @@ bool try_map_weights(const std::string & path, const gguf_context * gguf,
                      ggml_backend_buffer_t & buffer,
                      std::unique_ptr<WeightMapping> & mapping) noexcept;
 
-}  // namespace transcribe::whisper
+}  // namespace transcribe::load_common

@@ -4,7 +4,7 @@
 
 #pragma once
 
-#include "weights-mmap.h"
+#include "transcribe-weights-mmap.h"
 #include "ggml-backend.h"
 #include "ggml.h"
 #include "transcribe-backend.h"
@@ -273,14 +273,14 @@ struct WhisperModel final : public transcribe_model {
     std::mutex             coreml_fallback_mutex;
     ggml_context *         encoder_ctx_meta       = nullptr;
     ggml_backend_buffer_t  encoder_backend_buffer = nullptr;
-    std::unique_ptr<WeightMapping> encoder_mapping;
+    std::unique_ptr<load_common::WeightMapping> encoder_mapping;
 #endif
 
     // Runtime backend plan. See transcribe-backend.h.
     transcribe::BackendPlan plan;
     ggml_backend_buffer_t   backend_buffer = nullptr;
     // Weight file pages remain mapped through buffer and backend teardown.
-    std::unique_ptr<WeightMapping> weight_mapping;
+    std::unique_ptr<load_common::WeightMapping> weight_mapping;
 
     // Language token ids keyed by BCP-47 short code (from general.languages).
     // Resolves a params.language string to the <|lang_xx|> token id (whisper

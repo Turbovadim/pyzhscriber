@@ -1,6 +1,6 @@
 // Small macOS checks for immutable weight mappings and copied fallback.
 // Run separately with: cpu | metal-shared | metal-private
-#include "arch/whisper/weights-mmap.h"
+#include "transcribe-weights-mmap.h"
 
 #include "ggml-alloc.h"
 #include "ggml-backend-impl.h"
@@ -24,8 +24,8 @@
 #include <string>
 #include <vector>
 
-using transcribe::whisper::WeightMapping;
-using transcribe::whisper::try_map_weights;
+using transcribe::load_common::WeightMapping;
+using transcribe::load_common::try_map_weights;
 
 namespace {
 void require(bool condition, const char * message) {
@@ -67,19 +67,29 @@ struct Fixture {
         auto * encoder = ggml_new_tensor_1d(source.get(), GGML_TYPE_F32, 32768);
         auto * f32 = ggml_new_tensor_2d(source.get(), GGML_TYPE_F32, 257, 3);
         auto * q8 = ggml_new_tensor_2d(source.get(), GGML_TYPE_Q8_0, 256, 17);
+        auto * f16 = ggml_new_tensor_3d(source.get(), GGML_TYPE_F16, 1, 32, 16);
+        auto * q5 = ggml_new_tensor_2d(source.get(), GGML_TYPE_Q5_K, 256, 17);
+        auto * q6 = ggml_new_tensor_2d(source.get(), GGML_TYPE_Q6_K, 256, 17);
         auto * bias = ggml_new_tensor_1d(source.get(), GGML_TYPE_F32, 129);
         ggml_set_name(encoder, "enc.unused");
         ggml_set_name(f32, "dec.f32");
         ggml_set_name(q8, "dec.q8");
+        ggml_set_name(f16, "dec.f16");
+        ggml_set_name(q5, "dec.q5");
+        ggml_set_name(q6, "dec.q6");
         ggml_set_name(bias, "dec.bias");
-        for (auto * tensor : {encoder, f32, q8, bias}) {
+        for (auto * tensor : {encoder, f32, q8, f16, q5, q6, bias}) {
             auto * bytes = static_cast<unsigned char *>(tensor->data);
             for (size_t i = 0; i < ggml_nbytes(tensor); ++i) bytes[i] = (i * 37 + i / 251 + 19) & 255;
         }
+        auto * half = static_cast<ggml_fp16_t *>(f16->data);
+        for (int64_t i = 0; i < ggml_nelements(f16); ++i) {
+            half[i] = ggml_fp32_to_fp16(static_cast<float>(i % 257 - 128) * 0.125f);
+        }
         if (interleave) {
-            for (auto * tensor : {f32, encoder, q8, bias}) gguf_add_tensor(catalog.get(), tensor);
+            for (auto * tensor : {f32, encoder, q8, f16, q5, q6, bias}) gguf_add_tensor(catalog.get(), tensor);
         } else {
-            for (auto * tensor : {encoder, f32, q8, bias}) gguf_add_tensor(catalog.get(), tensor);
+            for (auto * tensor : {encoder, f32, q8, f16, q5, q6, bias}) gguf_add_tensor(catalog.get(), tensor);
         }
         require(gguf_write_to_file(catalog.get(), path.c_str(), false), "fixture write failed");
         ggml_context * raw = nullptr;
@@ -94,9 +104,9 @@ struct Fixture {
     }
 
     Context tensors(bool include_encoder = false) const {
-        Context ctx(ggml_init({4 * ggml_tensor_overhead() + 256, nullptr, true}), ggml_free);
+        Context ctx(ggml_init({7 * ggml_tensor_overhead() + 256, nullptr, true}), ggml_free);
         require(ctx != nullptr, "decoder context allocation failed");
-        for (const char * name : {"enc.unused", "dec.f32", "dec.q8", "dec.bias"}) {
+        for (const char * name : {"enc.unused", "dec.f32", "dec.q8", "dec.f16", "dec.q5", "dec.q6", "dec.bias"}) {
             if (!include_encoder && std::strcmp(name, "enc.unused") == 0) continue;
             auto * original = ggml_get_tensor(source.get(), name);
             auto * copy = ggml_dup_tensor(ctx.get(), original);
@@ -118,6 +128,30 @@ void check_bytes(ggml_context * context, const Fixture & fixture) {
         std::vector<unsigned char> bytes(ggml_nbytes(tensor));
         ggml_backend_tensor_get(tensor, bytes.data(), 0, bytes.size());
         require(std::memcmp(bytes.data(), original->data, bytes.size()) == 0, "mapped bytes differ");
+    }
+}
+
+void check_cpu_promotion(ggml_context * context, ggml_backend_t backend) {
+    auto * source = ggml_get_tensor(context, "dec.f16");
+    auto * promoted = source;
+    transcribe::BackendPlan plan;
+    plan.primary = backend;
+    plan.primary_kind = transcribe::BackendKind::Cpu;
+    ggml_context * raw_context = nullptr;
+    ggml_backend_buffer_t raw_buffer = nullptr;
+    const auto status = transcribe::load_common::promote_conv_pw_f16_to_f32_on_cpu(
+        plan, {{&promoted, source}}, "mapped F16 test", &raw_context, &raw_buffer);
+    Context replacement_context(raw_context, ggml_free);
+    Buffer replacement_buffer(raw_buffer, transcribe::safe_buffer_free);
+    require(status == TRANSCRIBE_OK && promoted != source && replacement_context && replacement_buffer,
+            "mapped F16 promotion failed");
+    require(promoted->type == GGML_TYPE_F32 && promoted->buffer != source->buffer,
+            "promotion did not allocate separate F32 storage");
+    std::vector<float> actual(ggml_nelements(source));
+    ggml_backend_tensor_get(promoted, actual.data(), 0, actual.size() * sizeof(float));
+    const auto * half = static_cast<const ggml_fp16_t *>(source->data);
+    for (size_t i = 0; i < actual.size(); ++i) {
+        require(actual[i] == ggml_fp16_to_fp32(half[i]), "mapped F16 promotion changed values");
     }
 }
 
@@ -188,6 +222,10 @@ void run(const std::string & mode) {
         }
         require(ggml_backend_metal_buffer_is_shared(buffer.get()) == shared, "wrong mapped buffer interface");
         check_bytes(context.get(), fixture);
+        if (!metal) {
+            check_cpu_promotion(context.get(), backend.get());
+            check_bytes(context.get(), fixture);
+        }
         require(unlink(fixture.path.c_str()) == 0, "fixture unlink failed");
         check_bytes(context.get(), fixture);
         auto * first = ggml_get_first_tensor(context.get());
@@ -226,7 +264,8 @@ void run(const std::string & mode) {
         std::filesystem::resize_file(missing_payload.path, gguf_get_data_offset(missing_payload.catalog.get()));
         rejected_then_copy(missing_payload, backend.get(), false);
     }
-    printf("PASS %s: exact F32/Q8_0 bytes, decoder and full spans, unlink/buffer/unmap lifetimes, "
+    printf("PASS %s: exact F32/F16/Q8_0/Q5_K/Q6_K bytes, separate CPU F32 promotion, "
+           "decoder and full spans, unlink/buffer/unmap lifetimes, "
            "backend-refusal cleanup, unknown-weight/interleaved rejection, "
            "truncated/out-of-file rejection and copied fallback\n", mode.c_str());
 }

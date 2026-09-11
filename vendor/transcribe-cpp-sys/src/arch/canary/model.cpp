@@ -208,6 +208,7 @@ CanaryModel::~CanaryModel() {
     plan.scheduler_list.clear();
     plan.primary      = nullptr;
     plan.primary_kind = transcribe::BackendKind::Unknown;
+    weight_mapping.reset();
 }
 
 namespace {
@@ -488,20 +489,27 @@ transcribe_status load(Loader & loader, const transcribe_model_load_params * par
     m->backend         = ggml_backend_name(m->plan.primary);
     m->primary_backend = m->plan.primary;
 
-    ggml_backend_buffer_t weights_buffer = ggml_backend_alloc_ctx_tensors(m->ctx_meta, m->plan.primary);
-    if (weights_buffer == nullptr) {
-        gguf_free(gguf_data);
-        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "canary: ggml_backend_alloc_ctx_tensors failed");
-        return TRANSCRIBE_ERR_GGUF;
-    }
-    m->backend_buffer = weights_buffer;
-    ggml_backend_buffer_set_usage(weights_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    const bool mapped_weights = load_common::try_map_weights(loader.path(), gguf_data, m->ctx_meta,
+                                                             m->plan.primary, m->backend_buffer, m->weight_mapping);
+    if (mapped_weights) {
+        log_msg(TRANSCRIBE_LOG_LEVEL_INFO, "canary: mapped %.1f MiB read-only GGUF weights",
+                static_cast<double>(m->weight_mapping->size) / (1024.0 * 1024.0));
+    } else {
+        ggml_backend_buffer_t weights_buffer = ggml_backend_alloc_ctx_tensors(m->ctx_meta, m->plan.primary);
+        if (weights_buffer == nullptr) {
+            gguf_free(gguf_data);
+            log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "canary: ggml_backend_alloc_ctx_tensors failed");
+            return TRANSCRIBE_ERR_GGUF;
+        }
+        m->backend_buffer = weights_buffer;
+        ggml_backend_buffer_set_usage(weights_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
-    if (const transcribe_status st =
-            transcribe::load_common::stream_tensor_data(loader.path(), gguf_data, m->ctx_meta, "canary");
-        st != TRANSCRIBE_OK) {
-        gguf_free(gguf_data);
-        return st;
+        if (const transcribe_status st =
+                transcribe::load_common::stream_tensor_data(loader.path(), gguf_data, m->ctx_meta, "canary");
+            st != TRANSCRIBE_OK) {
+            gguf_free(gguf_data);
+            return st;
+        }
     }
 
     gguf_free(gguf_data);
@@ -1178,9 +1186,8 @@ transcribe_status run(transcribe_session *          session,
         };
 
         // Two decoder loop variants, picked by primary backend kind:
-        //   GPU: build_step_graph — one static-topology graph reused for the
-        //     whole utterance, amortizing per-step graph_build + sched_alloc
-        //     dispatch overhead.
+        //   GPU: build_step_graph — reuse a static-topology graph until its
+        //     attention window fills, then double the window and rebuild.
         //   CPU: build_decoder_graph_kv per step — n_kv grows with n_past, so
         //     no dispatch overhead to amortize and no static-graph bandwidth tax.
         const bool primary_is_gpu = cm->plan.primary_kind != transcribe::BackendKind::Cpu &&
@@ -1188,9 +1195,7 @@ transcribe_status run(transcribe_session *          session,
                                     cm->plan.primary_kind != transcribe::BackendKind::Unknown;
 
         if (primary_is_gpu) {
-            // Static-graph step path (GPU). max_n_kv: pad to next power of two
-            // with a 1024 floor — Vulkan/Metal flash-attn dispatches ~30%
-            // faster on pow2 ne[1].
+            // Keep the existing decode ceiling; grow only the read window.
             int max_n_kv = 1024;
             while (max_n_kv < prompt_len + max_tokens) {
                 max_n_kv *= 2;
@@ -1199,35 +1204,48 @@ transcribe_status run(transcribe_session *          session,
                 max_n_kv = cc->kv_cache.n_ctx;
             }
 
-            if (!new_compute_ctx(8 * 1024 * 1024)) {
-                transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
-                                    "canary run: step compute context allocation failed — "
-                                    "out of memory.");
-                commit_result();
-                return TRANSCRIBE_ERR_OOM;
+            // Metal benefits from shorter reads on dictation. Keep the
+            // existing static window for other GPU backends.
+            int kv_window = cm->plan.primary_kind == transcribe::BackendKind::Metal ? 64 : max_n_kv;
+            while (kv_window < prompt_len) {
+                kv_window *= 2;
             }
-            StepBuild sb = build_step_graph(cc->compute_ctx, cm->weights, cm->hparams, cc->kv_cache, max_n_kv, T_enc,
-                                            cc->decoder_use_flash);
-            if (sb.graph == nullptr || sb.argmax_out == nullptr) {
-                log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "canary run: build_step_graph failed");
+            kv_window = std::min(kv_window, max_n_kv);
+
+            StepBuild sb{};
+            auto rebuild_step_graph = [&](int window) -> transcribe_status {
+                if (!new_compute_ctx(8 * 1024 * 1024)) {
+                    transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
+                                        "canary run: step compute context allocation failed — "
+                                        "out of memory.");
+                    return TRANSCRIBE_ERR_OOM;
+                }
+                sb = build_step_graph(cc->compute_ctx, cm->weights, cm->hparams, cc->kv_cache, window, T_enc,
+                                      cc->decoder_use_flash);
+                if (sb.graph == nullptr || sb.argmax_out == nullptr) {
+                    log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "canary run: build_step_graph failed");
+                    return TRANSCRIBE_ERR_GGUF;
+                }
+                ggml_backend_sched_reset(cc->sched);
+                if (!ggml_backend_sched_alloc_graph(cc->sched, sb.graph)) {
+                    transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
+                                        "canary run: step graph allocation failed — out of memory.");
+                    return TRANSCRIBE_ERR_OOM;
+                }
+                return TRANSCRIBE_OK;
+            };
+            if (const transcribe_status st = rebuild_step_graph(kv_window); st != TRANSCRIBE_OK) {
                 commit_result();
-                return TRANSCRIBE_ERR_GGUF;
-            }
-            ggml_backend_sched_reset(cc->sched);
-            if (!ggml_backend_sched_alloc_graph(cc->sched, sb.graph)) {
-                transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
-                                    "canary run: step graph allocation failed — out of memory.");
-                commit_result();
-                return TRANSCRIBE_ERR_OOM;
+                return st;
             }
 
-            // Mask buffer: full max_n_kv span, reused host-side. Positions
+            // Mask buffer: current read window, reused host-side. Positions
             // already populated by the prompt pass [0, prompt_len) start
             // attendable; remaining slots are -inf until each step flips
             // its newly-written position to attendable.
             const ggml_fp16_t        mask_zero    = ggml_fp32_to_fp16(0.0f);
             const ggml_fp16_t        mask_neg_inf = ggml_fp32_to_fp16(-INFINITY);
-            std::vector<ggml_fp16_t> step_mask(max_n_kv, mask_neg_inf);
+            std::vector<ggml_fp16_t> step_mask(kv_window, mask_neg_inf);
             for (int p = 0; p < prompt_len; ++p) {
                 step_mask[p] = mask_zero;
             }
@@ -1242,6 +1260,14 @@ transcribe_status run(transcribe_session *          session,
                                         n_past);
                     break;
                 }
+                if (n_past + 1 > kv_window) {
+                    kv_window = std::min(kv_window * 2, max_n_kv);
+                    step_mask.resize(kv_window, mask_neg_inf);
+                    if (const transcribe_status st = rebuild_step_graph(kv_window); st != TRANSCRIBE_OK) {
+                        commit_result();
+                        return st;
+                    }
+                }
 
                 int32_t token_val = next_token;
                 int32_t pos_val   = n_past;
@@ -1252,7 +1278,7 @@ transcribe_status run(transcribe_session *          session,
 
                 step_mask[n_past] = mask_zero;
                 ggml_backend_tensor_set(sb.mask_in, step_mask.data(), 0,
-                                        static_cast<size_t>(max_n_kv) * sizeof(ggml_fp16_t));
+                                        static_cast<size_t>(kv_window) * sizeof(ggml_fp16_t));
 
                 if (const ggml_status gs = ggml_backend_sched_graph_compute(cc->sched, sb.graph);
                     gs != GGML_STATUS_SUCCESS) {
