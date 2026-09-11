@@ -24,7 +24,11 @@ INSTALL_APP="/Applications/Pyzhscriber.app"
 INSTALL_STAGING="/Applications/.Pyzhscriber.installing.app"
 INSTALL_BACKUP="/Applications/.Pyzhscriber.previous.app"
 
-cargo build --locked --release --bin pyzhscriber --manifest-path "$PROJECT_DIR/Cargo.toml"
+# Metal's Objective-C availability checks need Clang's runtime, which Rust's
+# -nodefaultlibs link does not include automatically.
+CLANG_RUNTIME="$("$CC" --print-file-name=libclang_rt.osx.a)"
+cargo rustc --locked --release --bin pyzhscriber --manifest-path "$PROJECT_DIR/Cargo.toml" \
+  -- -C "link-arg=$CLANG_RUNTIME"
 
 if [[ "$APP_DIR" != "$PROJECT_DIR"/dist/Pyzhscriber.app ]]; then
   echo "Unexpected bundle path: $APP_DIR" >&2
