@@ -4,12 +4,13 @@ Pyzhscriber is a fork of [Handy](https://github.com/cjpais/Handy) by CJ Pais and
 
 Speech recognition runs locally through Handy's [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp) layer with Metal acceleration. This project builds on Handy's work, including its model catalog and distribution infrastructure. The vendored transcribe.cpp Rust bindings and native code include local patches described in [vendor/README.md](vendor/README.md).
 
-This is a developer preview. Build from source; there are no release binaries or CI workflows. The current build targets macOS with Apple Silicon. Other platforms are not supported by this setup.
+This is a developer preview for macOS with Apple Silicon. Download the DMG from [GitHub Releases](https://github.com/Turbovadim/pyzhscriber/releases), open it, and drag Pyzhscriber to Applications. The app is development-signed and not notarized, so macOS may require approval in System Settings → Privacy & Security on first launch. Other platforms are not supported by this setup.
 
 ## What it does
 
 - Single-model transcription with optional language limits, or language-to-model routing. The default routes use GigaAM for Russian and Parakeet for English.
 - Configurable push-to-talk or toggle shortcuts, microphone selection, and a recording overlay.
+- Menu bar controls with optional Dock hiding, and a pill voice sensitivity slider from 0.25× to 6×.
 - Direct typing, clipboard paste, or clipboard-only output.
 - Local transcript history and recording playback.
 - Optional transcript cleanup through an OpenAI-compatible API.
@@ -52,6 +53,8 @@ open /Applications/Pyzhscriber.app
 ```
 
 This builds a release bundle at `dist/Pyzhscriber.app`, signs it, and installs it at `/Applications/Pyzhscriber.app`, replacing an existing installation. If Pyzhscriber is running, the script quits it before replacement and relaunches it afterwards. This is a local development build, not a notarized distribution.
+
+Use `./scripts/package-macos.sh --dmg` to create a DMG and SHA-256 checksum in `dist/` without replacing the installed app.
 
 By default, the script selects the first installed Apple Development identity. To choose one explicitly:
 

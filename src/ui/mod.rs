@@ -78,6 +78,7 @@ pub struct RootView {
     downloads: HashMap<String, f32>,
     overlay: Option<WindowHandle<RecordingOverlay>>,
     open_dropdown: Option<SharedString>,
+    sensitivity_drag: Option<Bounds<Pixels>>,
     permission_statuses: PermissionStatuses,
     permission_setup_visible: bool,
     permission_polling: bool,
@@ -193,6 +194,7 @@ impl RootView {
             downloads: HashMap::new(),
             overlay: None,
             open_dropdown: None,
+            sensitivity_drag: None,
             permission_statuses,
             permission_setup_visible: !permission_statuses.all_granted(),
             permission_polling: false,
@@ -698,6 +700,127 @@ impl RootView {
                 }))
             })
             .into_any_element()
+    }
+
+    fn sensitivity_slider(&self, cx: &Context<Self>) -> AnyElement {
+        let sensitivity = self.settings.overlay_sensitivity.clamp(0.25, 6.0);
+        let fraction = (sensitivity / 0.25).ln() / (6.0_f32 / 0.25).ln();
+        let bounds = std::rc::Rc::new(std::cell::Cell::new(Bounds::<Pixels>::default()));
+        let painted_bounds = bounds.clone();
+        let click_bounds = bounds.clone();
+        let view = cx.entity().downgrade();
+        div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .child(
+                div()
+                    .id("voice-sensitivity")
+                    .relative()
+                    .w(px(160.0))
+                    .h(px(24.0))
+                    .cursor_pointer()
+                    .child(
+                        canvas(
+                            move |area, _, _| painted_bounds.set(area),
+                            move |_, _, window, _| {
+                                let moving_view = view.clone();
+                                window.on_mouse_event(
+                                    move |event: &gpui::MouseMoveEvent, phase, _, cx| {
+                                        if !phase.capture() {
+                                            return;
+                                        }
+                                        let _ = moving_view.update(cx, |this, cx| {
+                                            if let Some(bounds) = this.sensitivity_drag {
+                                                if event.pressed_button == Some(MouseButton::Left) {
+                                                    this.set_sensitivity_at(
+                                                        event.position.x,
+                                                        bounds,
+                                                        cx,
+                                                    );
+                                                } else {
+                                                    this.sensitivity_drag = None;
+                                                }
+                                            }
+                                        });
+                                    },
+                                );
+                                let released_view = view.clone();
+                                window.on_mouse_event(
+                                    move |event: &gpui::MouseUpEvent, phase, _, cx| {
+                                        if !phase.capture() || event.button != MouseButton::Left {
+                                            return;
+                                        }
+                                        let _ = released_view.update(cx, |this, cx| {
+                                            if let Some(bounds) = this.sensitivity_drag.take() {
+                                                this.set_sensitivity_at(
+                                                    event.position.x,
+                                                    bounds,
+                                                    cx,
+                                                );
+                                            }
+                                        });
+                                    },
+                                );
+                            },
+                        )
+                        .absolute()
+                        .inset_0(),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(10.0))
+                            .w_full()
+                            .h(px(4.0))
+                            .rounded_full()
+                            .bg(theme::border()),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(10.0))
+                            .w(px(160.0 * fraction))
+                            .h(px(4.0))
+                            .rounded_full()
+                            .bg(theme::accent()),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(148.0 * fraction))
+                            .top(px(6.0))
+                            .size(px(12.0))
+                            .rounded_full()
+                            .bg(theme::text()),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                            this.sensitivity_drag = Some(click_bounds.get());
+                            this.set_sensitivity_at(event.position.x, click_bounds.get(), cx);
+                        }),
+                    ),
+            )
+            .child(
+                div()
+                    .w(px(44.0))
+                    .text_sm()
+                    .text_color(theme::muted())
+                    .child(format!("{sensitivity:.2}×")),
+            )
+            .into_any_element()
+    }
+
+    fn set_sensitivity_at(&mut self, x: Pixels, bounds: Bounds<Pixels>, cx: &mut Context<Self>) {
+        if bounds.size.width <= px(0.0) {
+            return;
+        }
+        let fraction = ((x - bounds.origin.x) / bounds.size.width).clamp(0.0, 1.0);
+        let sensitivity = (0.25 * (6.0_f32 / 0.25).powf(fraction) * 100.0).round() / 100.0;
+        if self.settings.overlay_sensitivity != sensitivity {
+            self.save(|settings| settings.overlay_sensitivity = sensitivity, cx);
+        }
     }
 
     fn switch<F>(
@@ -1651,6 +1774,11 @@ impl RootView {
                 ));
                 if self.settings.show_overlay {
                     rows.push(self.detailed_control_row(
+                        "Voice sensitivity",
+                        Some("How strongly the pill reacts to your voice".into()),
+                        self.sensitivity_slider(cx),
+                    ));
+                    rows.push(self.detailed_control_row(
                         "Bubbly overlay",
                         Some("The pill jiggles softly with your voice".into()),
                         self.switch(
@@ -2546,7 +2674,24 @@ impl RootView {
                         "Show menu bar icon",
                         self.settings.show_tray_icon,
                         cx,
-                        |settings, value| settings.show_tray_icon = value,
+                        |settings, value| {
+                            settings.show_tray_icon = value;
+                            if !value {
+                                settings.hide_from_dock = false;
+                            }
+                        },
+                    ),
+                    self.toggle_row(
+                        "hide-from-dock",
+                        "Hide from Dock",
+                        self.settings.hide_from_dock,
+                        cx,
+                        |settings, value| {
+                            settings.hide_from_dock = value;
+                            if value {
+                                settings.show_tray_icon = true;
+                            }
+                        },
                     ),
                     self.toggle_row(
                         "start-hidden",

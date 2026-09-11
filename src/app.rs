@@ -74,12 +74,7 @@ pub fn run() {
             )
             .expect("open Pyzhscriber window");
         register_menus(cx, controller.clone(), main_window);
-        if settings.show_tray_icon {
-            match AppTray::new() {
-                Ok(tray) => tray.listen(controller.clone(), main_window, cx),
-                Err(error) => log::warn!("menu bar icon unavailable: {error:#}"),
-            }
-        }
+        AppTray::listen(controller.clone(), main_window, cx);
         // An accessory app orders new windows in behind whatever is frontmost, so
         // without activating here the window is on screen but buried and the
         // launch looks like nothing happened. Recording still never activates,
@@ -92,17 +87,29 @@ pub fn run() {
 
 #[cfg(target_os = "macos")]
 fn set_regular_activation_policy() {
+    set_dock_visible(true);
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn set_dock_visible(visible: bool) {
     use objc2::MainThreadMarker;
     use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 
     if let Some(mtm) = MainThreadMarker::new() {
         let app = NSApplication::sharedApplication(mtm);
-        app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+        app.setActivationPolicy(if visible {
+            NSApplicationActivationPolicy::Regular
+        } else {
+            NSApplicationActivationPolicy::Accessory
+        });
     }
 }
 
 #[cfg(not(target_os = "macos"))]
 fn set_regular_activation_policy() {}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn set_dock_visible(_: bool) {}
 
 actions!(
     pyzhscriber,

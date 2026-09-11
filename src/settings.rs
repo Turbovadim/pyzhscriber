@@ -74,6 +74,8 @@ pub struct AppSettings {
     pub vad_enabled: bool,
     pub show_overlay: bool,
     pub bubbly_overlay: bool,
+    pub overlay_sensitivity: f32,
+    pub hide_from_dock: bool,
     pub start_hidden: bool,
     pub show_tray_icon: bool,
     pub autostart_enabled: bool,
@@ -109,6 +111,8 @@ impl Default for AppSettings {
             vad_enabled: true,
             show_overlay: true,
             bubbly_overlay: false,
+            overlay_sensitivity: 1.0,
+            hide_from_dock: false,
             start_hidden: false,
             show_tray_icon: true,
             autostart_enabled: false,
@@ -292,6 +296,22 @@ fn bool_at(source: &serde_json::Value, key: &str, default: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overlay_and_dock_preferences_support_existing_settings() {
+        let settings: AppSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.overlay_sensitivity, 1.0);
+        assert!(!settings.hide_from_dock);
+        let settings = AppSettings {
+            overlay_sensitivity: 2.5,
+            hide_from_dock: true,
+            ..settings
+        };
+        let restored: AppSettings =
+            serde_json::from_slice(&serde_json::to_vec(&settings).unwrap()).unwrap();
+        assert_eq!(restored.overlay_sensitivity, 2.5);
+        assert!(restored.hide_from_dock);
+    }
 
     #[test]
     fn defaults_keep_routed_and_single_models_independent() {

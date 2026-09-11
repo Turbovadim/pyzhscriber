@@ -119,7 +119,10 @@ impl AppController {
     }
 
     pub fn mic_levels(&self) -> [f32; 9] {
-        self.recorder.levels()
+        let sensitivity = self.settings.read().overlay_sensitivity.clamp(0.25, 6.0);
+        self.recorder
+            .levels()
+            .map(|level| (level * sensitivity).clamp(0.0, 1.0))
     }
 
     pub fn save_settings(&self, settings: AppSettings) -> Result<()> {
