@@ -1,7 +1,7 @@
 use crate::models::ModelRegistry;
 use crate::settings::{AppSettings, TranscriptionMode};
 use anyhow::{Context, Result, anyhow};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 use std::sync::Arc;
 use transcribe_cpp::{
     Backend, Model, ModelOptions, RunExtension, RunOptions, Task, WhisperRunOptions,
@@ -17,6 +17,7 @@ struct LoadedEngine {
 
 pub struct Transcriber {
     registry: Arc<ModelRegistry>,
+    shutting_down: RwLock<bool>,
     loaded: Mutex<Option<LoadedEngine>>,
     last_routed_language: Mutex<Option<String>>,
     last_single_language: Mutex<Option<String>>,
@@ -30,6 +31,7 @@ impl Transcriber {
         }
         Self {
             registry,
+            shutting_down: RwLock::new(false),
             loaded: Mutex::new(None),
             last_routed_language: Mutex::new(None),
             last_single_language: Mutex::new(None),
@@ -37,6 +39,7 @@ impl Transcriber {
     }
 
     pub fn preload_for(&self, settings: &AppSettings) -> Result<()> {
+        let _operation = self.begin_operation()?;
         let single_uses_external_detector = settings.transcription_mode
             == TranscriptionMode::Single
             && settings.allowed_languages.len() > 1
@@ -59,6 +62,7 @@ impl Transcriber {
     }
 
     pub fn transcribe(&self, audio: &[f32], settings: &AppSettings) -> Result<String> {
+        let _operation = self.begin_operation()?;
         let single_uses_native_constraint = uses_native_language_constraint(
             settings.transcription_mode,
             &settings.allowed_languages,
@@ -114,6 +118,21 @@ impl Transcriber {
             text.push(' ');
         }
         Ok(text)
+    }
+
+    /// Waits for model users to finish, then frees Metal resources before native
+    /// process-exit destructors run. Workers may still hold an Arc to this object.
+    pub fn shutdown(&self) {
+        let mut shutting_down = self.shutting_down.write();
+        *shutting_down = true;
+        self.unload();
+    }
+
+    // Keep this guard until all local Model clones and Sessions have been dropped.
+    fn begin_operation(&self) -> Result<RwLockReadGuard<'_, bool>> {
+        let shutting_down = self.shutting_down.read();
+        anyhow::ensure!(!*shutting_down, "transcriber is shutting down");
+        Ok(shutting_down)
     }
 
     pub fn unload(&self) {
@@ -234,8 +253,82 @@ fn uses_native_language_constraint(
 
 #[cfg(test)]
 mod tests {
-    use super::{choose_allowed_language, uses_native_language_constraint};
-    use crate::settings::TranscriptionMode;
+    use super::{Transcriber, choose_allowed_language, uses_native_language_constraint};
+    use crate::models::ModelRegistry;
+    use crate::settings::{AppSettings, TranscriptionMode};
+    use std::sync::Arc;
+
+    #[test]
+    fn shutdown_rejects_new_model_work() {
+        let transcriber = Transcriber::new(Arc::new(ModelRegistry::new().unwrap()));
+        transcriber.shutdown();
+        transcriber.shutdown();
+
+        let settings = AppSettings::default();
+        for result in [
+            transcriber.preload_for(&settings),
+            transcriber.transcribe(&[], &settings).map(|_| ()),
+        ] {
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "transcriber is shutting down"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[ignore = "requires Metal and the installed default Whisper model"]
+    fn metal_shutdown_exits_cleanly_with_live_workers() {
+        const CHILD: &str = "PYZHSCRIBER_TEST_METAL_SHUTDOWN";
+        if let Ok(mode) = std::env::var(CHILD) {
+            let transcriber = Arc::new(Transcriber::new(Arc::new(ModelRegistry::new().unwrap())));
+            let settings = AppSettings {
+                transcription_mode: TranscriptionMode::Single,
+                ..AppSettings::default()
+            };
+            transcriber.preload_for(&settings).unwrap();
+            assert!(
+                transcriber
+                    .ensure_loaded(&settings.selected_model)
+                    .unwrap()
+                    .backend()
+                    .starts_with("MTL"),
+                "this test must exercise the Metal backend"
+            );
+            if mode == "active" {
+                let worker = transcriber.clone();
+                let (ready, started) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let _operation = worker.begin_operation().unwrap();
+                    let _model = worker.ensure_loaded(&settings.selected_model).unwrap();
+                    ready.send(()).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                });
+                started.recv().unwrap();
+            }
+            transcriber.shutdown();
+            assert!(transcriber.loaded_model_id().is_none());
+            // NSApplication exits without dropping Rust owners held by workers.
+            // Run native exit handlers in a child so a Metal abort fails the test.
+            std::mem::forget(transcriber);
+            std::process::exit(0);
+        }
+
+        for mode in ["idle", "active"] {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "transcription::tests::metal_shutdown_exits_cleanly_with_live_workers",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env(CHILD, mode)
+                .status()
+                .unwrap();
+            assert!(status.success(), "Metal shutdown ({mode}) failed: {status}");
+        }
+    }
 
     #[test]
     fn routing_prefers_an_allowed_detection() {

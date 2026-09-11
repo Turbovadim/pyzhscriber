@@ -29,6 +29,14 @@ pub fn run() {
 
     application().with_assets(Assets).run(move |cx: &mut App| {
         gpui_tokio::init(cx);
+        let controller_for_quit = controller.clone();
+        cx.on_app_quit(move |_| {
+            // Free native models synchronously: GPUI limits how long it waits
+            // for async quit hooks, but Metal teardown requires every buffer gone.
+            controller_for_quit.shutdown();
+            std::future::ready(())
+        })
+        .detach();
         // A regular app so Pyzhscriber has a Dock icon and a menu bar. What keeps
         // the synthesized paste in the user's text field is that nothing on the
         // recording path activates: the overlay is a non-activating panel, so the

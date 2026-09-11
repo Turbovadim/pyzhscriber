@@ -64,6 +64,7 @@ pub struct AppController {
     event_tx: async_channel::Sender<RuntimeEvent>,
     event_rx: async_channel::Receiver<RuntimeEvent>,
     shortcut_down: AtomicBool,
+    shutting_down: AtomicBool,
     shortcut_listener_started: AtomicBool,
     shortcut_recorder: Mutex<Option<ShortcutRecorder>>,
     activity_generation: Arc<AtomicU64>,
@@ -88,6 +89,7 @@ impl AppController {
             event_tx,
             event_rx,
             shortcut_down: AtomicBool::new(false),
+            shutting_down: AtomicBool::new(false),
             shortcut_listener_started: AtomicBool::new(false),
             shortcut_recorder: Mutex::new(None),
             activity_generation: Arc::new(AtomicU64::new(0)),
@@ -96,6 +98,12 @@ impl AppController {
 
     pub fn start(self: &Arc<Self>) {
         self.start_shortcut_listener();
+    }
+
+    pub fn shutdown(&self) {
+        self.shutting_down.store(true, Ordering::SeqCst);
+        self.recorder.cancel();
+        self.transcriber.shutdown();
     }
 
     pub fn events(&self) -> async_channel::Receiver<RuntimeEvent> {
@@ -190,7 +198,7 @@ impl AppController {
     }
 
     pub fn start_recording(self: &Arc<Self>) {
-        if self.recorder.is_recording() {
+        if self.shutting_down.load(Ordering::SeqCst) || self.recorder.is_recording() {
             return;
         }
         let settings = self.settings();
@@ -301,7 +309,7 @@ impl AppController {
             .transcribe(&audio, &settings)
             .and_then(|text| post_process::clean(&text, &settings))
             .and_then(|text| {
-                if text.trim().is_empty() {
+                if self.shutting_down.load(Ordering::SeqCst) || text.trim().is_empty() {
                     return Ok(None);
                 }
                 output::deliver(&text, &settings)?;
@@ -379,6 +387,9 @@ impl AppController {
     }
 
     fn handle_key(self: &Arc<Self>, event: KeyEvent) {
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return;
+        }
         if self.feed_shortcut_recorder(event) {
             return;
         }

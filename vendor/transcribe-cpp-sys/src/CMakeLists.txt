@@ -80,6 +80,7 @@ add_library(transcribe
     arch/canary_qwen/encoder.cpp
     arch/canary_qwen/decoder.cpp
     arch/whisper/model.cpp
+    arch/whisper/weights-mmap.cpp
     arch/whisper/capabilities.cpp
     arch/whisper/weights.cpp
     arch/whisper/encoder.cpp

@@ -36,6 +36,22 @@ namespace conf = transcribe::conformer;
 using conf::layer_norm;
 using conf::named;
 
+// Store the unreshaped cross projections without changing the tensors used
+// by attention. Padding belongs to the cache allocation and stays untouched.
+void write_cross_kv(ggml_context * ctx, ggml_cgraph * graph, WhisperKvCache & cache,
+                    ggml_tensor * k, ggml_tensor * v, int layer) {
+    const int64_t d_model   = k->ne[0];
+    const int64_t T_enc     = k->ne[1];
+    const int64_t T_enc_pad = cache.T_enc_pad > 0 ? cache.T_enc_pad : T_enc;
+    const size_t  offset    = static_cast<size_t>(layer * T_enc_pad * d_model);
+    ggml_tensor * k_dst = ggml_view_1d(ctx, cache.cross_k, T_enc * d_model,
+                                      ggml_element_size(cache.cross_k) * offset);
+    ggml_tensor * v_dst = ggml_view_1d(ctx, cache.cross_v, T_enc * d_model,
+                                      ggml_element_size(cache.cross_v) * offset);
+    ggml_build_forward_expand(graph, ggml_cpy(ctx, k, k_dst));
+    ggml_build_forward_expand(graph, ggml_cpy(ctx, v, v_dst));
+}
+
 // Standard multi-head attention used by both self- and cross-attention
 // in the decoder. context==nullptr selects self-attention (Q/K/V from x);
 // non-null context selects cross-attention (Q from x, K/V from context).
@@ -57,7 +73,10 @@ ggml_tensor * mha_decoder(ggml_context * ctx,
                           ggml_tensor *  out_b,
                           int            n_heads,
                           int            d_model,
-                          bool           use_flash) {
+                          bool           use_flash,
+                          ggml_cgraph *  graph = nullptr,
+                          WhisperKvCache * cross_cache = nullptr,
+                          int            layer = 0) {
     const int     head_dim = d_model / n_heads;
     const float   scale    = 1.0f / std::sqrt(static_cast<float>(head_dim));
     const int64_t T_q      = x->ne[1];
@@ -75,6 +94,14 @@ ggml_tensor * mha_decoder(ggml_context * ctx,
     ggml_tensor * v = ggml_mul_mat(ctx, v_w, source);
     if (v_b != nullptr) {
         v = ggml_add(ctx, v, v_b);
+    }
+
+    if (cross_cache != nullptr && context != nullptr) {
+        // Q depends on preceding decoder layers. Expand it first so their
+        // activations finish before this layer's cross projections, instead
+        // of keeping every layer's F32 K/V live until the final expansion.
+        ggml_build_forward_expand(graph, q);
+        write_cross_kv(ctx, graph, *cross_cache, k, v, layer);
     }
 
     // [d_model, T] -> [head_dim, n_heads, T] -> permute to
@@ -142,7 +169,10 @@ ggml_tensor * build_block(ggml_context *          ctx,
                           const WhisperDecBlock & b,
                           int                     n_heads,
                           int                     d_model,
-                          bool                    use_flash) {
+                          bool                    use_flash,
+                          ggml_cgraph *           graph,
+                          WhisperKvCache *        cross_cache,
+                          int                     layer) {
     // Self-attention (causal).
     {
         ggml_tensor * y = layer_norm(ctx, x, b.norm_self_w, b.norm_self_b);
@@ -154,7 +184,8 @@ ggml_tensor * build_block(ggml_context *          ctx,
     {
         ggml_tensor * y = layer_norm(ctx, x, b.norm_cross_w, b.norm_cross_b);
         y = mha_decoder(ctx, y, encoder_hidden, /*mask=*/nullptr, b.cross_q_w, b.cross_q_b, b.cross_k_w, b.cross_v_w,
-                        b.cross_v_b, b.cross_out_w, b.cross_out_b, n_heads, d_model, use_flash);
+                        b.cross_v_b, b.cross_out_w, b.cross_out_b, n_heads, d_model, use_flash, graph, cross_cache,
+                        layer);
         x = ggml_add(ctx, x, y);
     }
     // FFN.
@@ -440,7 +471,12 @@ DecoderBuild build_decoder_prefill_graph(ggml_context *         ctx,
                                          const WhisperHParams & hp,
                                          int                    seq_len,
                                          int                    T_enc,
-                                         bool                   use_flash) {
+                                         bool                   use_flash,
+                                         ggml_tensor *          encoder_out,
+                                         bool                   skip_log_softmax,
+                                         int                    vocab_begin,
+                                         int                    vocab_count,
+                                         WhisperKvCache *       cross_cache) {
     DecoderBuild db{};
 
     if (ctx == nullptr || seq_len <= 0 || T_enc <= 0) {
@@ -462,14 +498,45 @@ DecoderBuild build_decoder_prefill_graph(ggml_context *         ctx,
     const int n_heads = hp.dec_n_heads;
     const int vocab   = hp.dec_vocab_size;
 
+    if (vocab_begin < 0 || vocab_begin >= vocab || vocab_count < 0 || vocab_count > vocab - vocab_begin) {
+        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
+                "whisper decoder: invalid vocabulary range (begin=%d, count=%d, vocab=%d)", vocab_begin,
+                vocab_count, vocab);
+        return db;
+    }
+    const int output_vocab = vocab_count > 0 ? vocab_count : vocab - vocab_begin;
+
+    if (encoder_out != nullptr &&
+        (encoder_out->type != GGML_TYPE_F32 || encoder_out->ne[0] != d_model || encoder_out->ne[1] != T_enc ||
+         encoder_out->ne[2] != 1 || encoder_out->ne[3] != 1)) {
+        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "whisper decoder: encoder output shape or type mismatch");
+        return db;
+    }
+
+    if (cross_cache != nullptr) {
+        const int T_enc_pad = cross_cache->T_enc_pad > 0 ? cross_cache->T_enc_pad : T_enc;
+        const int64_t required = static_cast<int64_t>(d_model) * T_enc_pad *
+                                 static_cast<int64_t>(w.dec_blocks.size());
+        if (cross_cache->n_batch != 1 || cross_cache->T_enc != T_enc || T_enc_pad < T_enc ||
+            cross_cache->cross_k == nullptr || cross_cache->cross_v == nullptr ||
+            ggml_nelements(cross_cache->cross_k) < required || ggml_nelements(cross_cache->cross_v) < required) {
+            log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "whisper decoder: cross cache shape mismatch");
+            return db;
+        }
+    }
+
     // ---- Inputs ------------------------------------------------------
     db.token_ids_in = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, seq_len);
     named(db.token_ids_in, "dec.token_ids");
     ggml_set_input(db.token_ids_in);
 
-    db.encoder_out_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_model, T_enc);
+    db.encoder_out_in = encoder_out != nullptr
+                            ? ggml_view_2d(ctx, encoder_out, d_model, T_enc, encoder_out->nb[1], 0)
+                            : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_model, T_enc);
     named(db.encoder_out_in, "dec.encoder_out");
-    ggml_set_input(db.encoder_out_in);
+    if (encoder_out == nullptr) {
+        ggml_set_input(db.encoder_out_in);
+    }
 
     // Causal mask declared F32, cast to F16 inside (flash_attn_ext /
     // soft_max_ext want f16).
@@ -505,11 +572,20 @@ DecoderBuild build_decoder_prefill_graph(ggml_context *         ctx,
     transcribe::debug::mark_tensor_for_dump(x);
     db.dumps.embed_sum = x;
 
+    // Create the graph before the blocks so optional cache copies can be
+    // inserted alongside the original F32 projection nodes.
+    db.graph = ggml_new_graph_custom(ctx, 8192, false);
+    if (db.graph == nullptr) {
+        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "whisper decoder: ggml_new_graph_custom failed");
+        return db;
+    }
+
     // ---- Decoder blocks ----
     const int n_blocks = static_cast<int>(w.dec_blocks.size());
     db.dumps.block_outs.reserve(static_cast<size_t>(n_blocks));
     for (int i = 0; i < n_blocks; ++i) {
-        x = build_block(ctx, x, db.encoder_out_in, causal_mask, w.dec_blocks[i], n_heads, d_model, use_flash);
+        x = build_block(ctx, x, db.encoder_out_in, causal_mask, w.dec_blocks[i], n_heads, d_model, use_flash,
+                        db.graph, cross_cache, i);
 
         char bname[64];
         std::snprintf(bname, sizeof(bname), "dec.block.%d.out", i);
@@ -526,28 +602,28 @@ DecoderBuild build_decoder_prefill_graph(ggml_context *         ctx,
 
     // ---- Logits head (tied weight, no bias) ----
     // mul_mat(W [d_model, vocab], x [d_model, seq_len]) -> [vocab, seq_len].
-    ggml_tensor * logits_raw = ggml_mul_mat(ctx, w.dec_top.token_embd_w, x);
+    ggml_tensor * head_weight = w.dec_top.token_embd_w;
+    if (vocab_begin != 0 || output_vocab != vocab) {
+        head_weight = ggml_view_2d(ctx, head_weight, d_model, output_vocab, head_weight->nb[1],
+                                   vocab_begin * head_weight->nb[1]);
+    }
+    ggml_tensor * logits_raw = ggml_mul_mat(ctx, head_weight, x);
     named(logits_raw, "dec.logits_raw");
     transcribe::debug::mark_tensor_for_dump(logits_raw);
     db.dumps.logits_raw = logits_raw;
 
-    ggml_tensor * logits = ggml_log(ctx, ggml_soft_max(ctx, logits_raw));
-    named(logits, "dec.logits");
-    transcribe::debug::mark_tensor_for_dump(logits);
-    db.dumps.logits = logits;
+    ggml_tensor * logits = logits_raw;
+    if (!skip_log_softmax) {
+        logits = ggml_log(ctx, ggml_soft_max(ctx, logits_raw));
+        named(logits, "dec.logits");
+        transcribe::debug::mark_tensor_for_dump(logits);
+        db.dumps.logits = logits;
+    }
 
     db.out = logits;
     ggml_set_output(db.out);
 
-    // 8192 leaves headroom up to large-v3 (32 blocks, ~20 ops each).
-    db.graph = ggml_new_graph_custom(ctx, 8192, false);
-    if (db.graph == nullptr) {
-        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "whisper decoder: ggml_new_graph_custom failed");
-        return db;
-    }
     ggml_build_forward_expand(db.graph, db.out);
-
-    (void) vocab;
 
     return db;
 }
@@ -583,10 +659,6 @@ DecoderBuild build_cross_kv_graph(ggml_context *         ctx,
         return db;
     }
 
-    // Layer slots are spaced by T_enc_pad (allocator size) but each writes
-    // only T_enc rows; trailing T_enc_pad - T_enc rows stay zero.
-    const int T_enc_pad = kv_cache.T_enc_pad > 0 ? kv_cache.T_enc_pad : T_enc;
-
     const int n_layers = static_cast<int>(w.dec_blocks.size());
     for (int il = 0; il < n_layers; ++il) {
         const auto & blk = w.dec_blocks[il];
@@ -598,21 +670,7 @@ DecoderBuild build_cross_kv_graph(ggml_context *         ctx,
             Vcross = ggml_add(ctx, Vcross, blk.cross_v_b);
         }
 
-        // Write [d_model, T_enc] into this layer's slot at element offset
-        // il * T_enc_pad * d_model (slots don't overlap).
-        const size_t k_elem = ggml_element_size(kv_cache.cross_k);
-        const size_t v_elem = ggml_element_size(kv_cache.cross_v);
-
-        ggml_tensor * k_dst =
-            ggml_view_1d(ctx, kv_cache.cross_k, static_cast<int64_t>(T_enc) * d_model,
-                         k_elem * static_cast<size_t>(static_cast<int64_t>(il) * T_enc_pad * d_model));
-
-        ggml_tensor * v_dst =
-            ggml_view_1d(ctx, kv_cache.cross_v, static_cast<int64_t>(T_enc) * d_model,
-                         v_elem * static_cast<size_t>(static_cast<int64_t>(il) * T_enc_pad * d_model));
-
-        ggml_build_forward_expand(db.graph, ggml_cpy(ctx, Kcross, k_dst));
-        ggml_build_forward_expand(db.graph, ggml_cpy(ctx, Vcross, v_dst));
+        write_cross_kv(ctx, db.graph, kv_cache, Kcross, Vcross, il);
     }
 
     return db;
@@ -627,7 +685,8 @@ DecoderBuild build_decoder_graph_kv(ggml_context *         ctx,
                                     int                    T_enc,
                                     int                    kv_pad,
                                     bool                   skip_log_softmax,
-                                    bool                   use_flash) {
+                                    bool                   use_flash,
+                                    const std::vector<int32_t> & logits_rows) {
     DecoderBuild db{};
 
     if (ctx == nullptr || n_tokens <= 0 || T_enc <= 0) {
@@ -636,6 +695,13 @@ DecoderBuild build_decoder_graph_kv(ggml_context *         ctx,
                 "(ctx=%p, n_tokens=%d, T_enc=%d)",
                 static_cast<void *>(ctx), n_tokens, T_enc);
         return db;
+    }
+    for (int32_t row : logits_rows) {
+        if (row < 0 || row >= n_tokens) {
+            log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "whisper decoder_kv: logits row %d outside [0, %d)", row,
+                    n_tokens);
+            return db;
+        }
     }
     const int n_kv_active = n_past + n_tokens;
     if (n_kv_active > kv_cache.n_ctx) {
@@ -774,8 +840,20 @@ DecoderBuild build_decoder_graph_kv(ggml_context *         ctx,
         db.dumps.out_before_head = x;
     }
 
+    // The transformer still evaluates every prompt position to populate its
+    // KV cache. Only the requested hidden-state rows need the large tied
+    // vocabulary projection. Views preserve the original F32 values.
+    ggml_tensor * head_input = x;
+    if (!logits_rows.empty()) {
+        head_input = nullptr;
+        for (int32_t row : logits_rows) {
+            ggml_tensor * selected = ggml_view_2d(ctx, x, d_model, 1, x->nb[1], row * x->nb[1]);
+            head_input = head_input == nullptr ? selected : ggml_concat(ctx, head_input, selected, 1);
+        }
+    }
+
     // ---- Logits head (tied weight, no bias) ----
-    ggml_tensor * logits_raw = ggml_mul_mat(ctx, w.dec_top.token_embd_w, x);
+    ggml_tensor * logits_raw = ggml_mul_mat(ctx, w.dec_top.token_embd_w, head_input);
     named(logits_raw, "dec.logits_raw");
     if (n_past == 0) {
         transcribe::debug::mark_tensor_for_dump(logits_raw);

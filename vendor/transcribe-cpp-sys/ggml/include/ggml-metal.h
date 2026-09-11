@@ -44,6 +44,13 @@ GGML_BACKEND_API ggml_backend_t ggml_backend_metal_init(void);
 
 GGML_BACKEND_API bool ggml_backend_is_metal(ggml_backend_t backend);
 
+// Shared and mapped Metal buffers have CPU-addressable tensor data. Private
+// buffers do not. Synchronize pending backend work before accessing it.
+GGML_BACKEND_API bool ggml_backend_metal_buffer_is_shared(ggml_backend_buffer_t buffer);
+
+// True only for the default shared storage type, excluding private storage.
+GGML_BACKEND_API bool ggml_backend_metal_buffer_type_is_shared(ggml_backend_buffer_type_t buft);
+
 GGML_BACKEND_API void ggml_backend_metal_set_abort_callback(ggml_backend_t backend, ggml_abort_callback abort_callback, void * user_data);
 
 // helper to check if the device supports a specific family

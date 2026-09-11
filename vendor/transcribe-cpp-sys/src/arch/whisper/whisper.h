@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "weights-mmap.h"
 #include "ggml-backend.h"
 #include "ggml.h"
 #include "transcribe-backend.h"
@@ -272,11 +273,14 @@ struct WhisperModel final : public transcribe_model {
     std::mutex             coreml_fallback_mutex;
     ggml_context *         encoder_ctx_meta       = nullptr;
     ggml_backend_buffer_t  encoder_backend_buffer = nullptr;
+    std::unique_ptr<WeightMapping> encoder_mapping;
 #endif
 
     // Runtime backend plan. See transcribe-backend.h.
     transcribe::BackendPlan plan;
     ggml_backend_buffer_t   backend_buffer = nullptr;
+    // Weight file pages remain mapped through buffer and backend teardown.
+    std::unique_ptr<WeightMapping> weight_mapping;
 
     // Language token ids keyed by BCP-47 short code (from general.languages).
     // Resolves a params.language string to the <|lang_xx|> token id (whisper
@@ -306,9 +310,8 @@ struct WhisperSession final : public transcribe_session {
     // Persistent backend-resident encoder output (see WhisperEncOut).
     WhisperEncOut enc_out;
 
-    // Host-side mirror of the encoder output, populated only when a path needs
-    // an F32 input fed via ggml_backend_tensor_set (language detection on the
-    // first chunk, dump-emitting validation runs). Off the per-chunk hot path.
+    // Staging buffer for Core ML on backends without CPU-addressable storage,
+    // and for packing encoder outputs in the offline batch path.
     std::vector<float> enc_host;
     int                enc_T = 0; // number of encoder frames (1500)
 

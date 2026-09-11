@@ -181,6 +181,10 @@ static bool ggml_backend_buffer_is_metal(ggml_backend_buffer_t buffer) {
            buffer->iface.free_buffer == ggml_backend_metal_buffer_private_free_buffer;
 }
 
+bool ggml_backend_metal_buffer_is_shared(ggml_backend_buffer_t buffer) {
+    return buffer != nullptr && buffer->iface.free_buffer == ggml_backend_metal_buffer_shared_free_buffer;
+}
+
 //
 // buffer types
 //
@@ -318,6 +322,10 @@ static ggml_backend_buffer_type_t ggml_backend_metal_buffer_type_shared(int devi
     }
 
     return &bufts[device];
+}
+
+bool ggml_backend_metal_buffer_type_is_shared(ggml_backend_buffer_type_t buft) {
+    return buft != nullptr && buft->iface.alloc_buffer == ggml_backend_metal_buffer_type_shared_alloc_buffer;
 }
 
 // default (private) buffer type
@@ -722,10 +730,18 @@ static ggml_backend_buffer_t ggml_backend_metal_device_buffer_mapped(ggml_backen
     ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
 
     ggml_metal_buffer_t res = ggml_metal_buffer_map(ctx_dev, ptr, size, max_tensor_size);
+    if (res == nullptr) {
+        return nullptr;
+    }
 
-    const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx_dev);
+    try {
+        const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx_dev);
 
-    return ggml_backend_buffer_init(ggml_backend_metal_buffer_type_mapped(props_dev->device), ggml_backend_metal_buffer_shared_i, res, size);
+        return ggml_backend_buffer_init(ggml_backend_metal_buffer_type_mapped(props_dev->device), ggml_backend_metal_buffer_shared_i, res, size);
+    } catch (...) {
+        ggml_metal_buffer_free(res);
+        throw;
+    }
 }
 
 static bool ggml_backend_metal_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {

@@ -24,10 +24,27 @@
 #include <cstring>
 #include <fstream>
 #include <ios>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
 namespace transcribe::load_common {
+
+bool buffer_allows_direct_io(ggml_backend_buffer_t buffer) {
+    if (buffer == nullptr) {
+        return false;
+    }
+    // Some host-visible accelerator buffers repack weights in set_tensor.
+    // Only these buffer types store the tensor bytes unchanged.
+    if (ggml_backend_buffer_get_type(buffer) == ggml_backend_cpu_buffer_type()) {
+        return true;
+    }
+#if defined(TRANSCRIBE_HAS_METAL) && !defined(TRANSCRIBE_GGML_BACKEND_DL)
+    return ggml_backend_metal_buffer_is_shared(buffer);
+#else
+    return false;
+#endif
+}
 
 // GPUs below MTLGPUFamilyApple7 (Intel iGPUs, AMD dGPUs on Intel Macs) have
 // no simdgroup matrix multiply; ggml's fallback matmul kernels silently
@@ -466,6 +483,13 @@ transcribe_status stream_tensor_data(const std::string &  path,
         const size_t toffset = gguf_get_tensor_offset(gguf_data, idx);
         const size_t nbytes  = ggml_nbytes(t);
 
+        const uintmax_t max_offset = static_cast<uintmax_t>(std::numeric_limits<std::streamoff>::max());
+        if (data_offset > max_offset || toffset > max_offset - data_offset ||
+            nbytes > static_cast<uintmax_t>(std::numeric_limits<std::streamsize>::max())) {
+            log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "%s: tensor \"%s\" exceeds stream offset limits", error_tag,
+                    t->name);
+            return TRANSCRIBE_ERR_GGUF;
+        }
         const std::streamoff abs_offset =
             static_cast<std::streamoff>(data_offset) + static_cast<std::streamoff>(toffset);
         fin.seekg(abs_offset);
@@ -474,21 +498,30 @@ transcribe_status stream_tensor_data(const std::string &  path,
             return TRANSCRIBE_ERR_GGUF;
         }
 
-        if (staging.size() < nbytes) {
-            staging.resize(nbytes);
+        ggml_backend_buffer_t buffer = t->view_src != nullptr ? t->view_src->buffer : t->buffer;
+        const bool host_accessible = buffer_allows_direct_io(buffer);
+
+        // These newly allocated weights are not in use yet. Read directly
+        // into CPU and shared Metal storage to avoid a tensor-sized copy.
+        // Other buffer types may transform whole tensors in set_tensor.
+        void * destination = t->data;
+        if (!host_accessible) {
+            if (staging.size() < nbytes) {
+                staging.resize(nbytes);
+            }
+            destination = staging.data();
         }
-        fin.read(reinterpret_cast<char *>(staging.data()), static_cast<std::streamsize>(nbytes));
+        GGML_ASSERT(destination != nullptr || nbytes == 0);
+        fin.read(static_cast<char *>(destination), static_cast<std::streamsize>(nbytes));
         if (!fin) {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "%s: short read for tensor \"%s\" (%zu bytes)", error_tag, t->name,
                     nbytes);
             return TRANSCRIBE_ERR_GGUF;
         }
 
-        // ggml_backend_tensor_set is the right call regardless of
-        // backend: on host buffers (CPU + Metal unified memory on
-        // Apple Silicon) it's a memcpy; on discrete GPUs it does
-        // the upload.
-        ggml_backend_tensor_set(t, staging.data(), 0, nbytes);
+        if (!host_accessible) {
+            ggml_backend_tensor_set(t, staging.data(), 0, nbytes);
+        }
     }
 
     return TRANSCRIBE_OK;

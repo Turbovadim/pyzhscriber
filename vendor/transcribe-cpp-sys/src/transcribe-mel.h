@@ -108,6 +108,8 @@ struct MelConfig {
     bool nemo_seq_len_ceil = false;
 };
 
+enum class MelLayout { ChannelMajor, FrameMajor };
+
 // Pure C++ log-mel extractor. Construct once, call compute() any
 // number of times. Thread-safety: const after construction; multiple
 // threads may call compute() concurrently.
@@ -118,7 +120,10 @@ class MelFrontend {
     // Run the full pipeline. pcm must be 16 kHz mono float32 in
     // [-1, 1]; n_samples is the number of input samples. The output
     // mel buffer is resized to num_mels * n_frames in row-major
-    // [num_mels, n_frames] layout.
+    // [num_mels, n_frames] layout by default. FrameMajor writes
+    // [n_frames, num_mels], which keeps Whisper's chunk slices contiguous.
+    // min_samples extends shorter inputs with zeros before pre-emphasis
+    // and centered STFT padding, without requiring a padded PCM copy.
     //
     // n_threads controls STFT parallelism. 0 (default) auto-detects
     // via std::thread::hardware_concurrency() capped at 8. The STFT
@@ -137,7 +142,9 @@ class MelFrontend {
                               std::vector<float> & out_mel,
                               int &                out_n_mels,
                               int &                out_n_frames,
-                              int                  n_threads = 0) const;
+                              int                  n_threads = 0,
+                              MelLayout            layout = MelLayout::ChannelMajor,
+                              size_t               min_samples = 0) const;
 
     // Number of mel bins (matches MelConfig::num_mels).
     int num_mels() const { return cfg_.num_mels; }

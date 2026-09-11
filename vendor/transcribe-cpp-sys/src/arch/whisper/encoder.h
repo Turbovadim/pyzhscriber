@@ -58,7 +58,7 @@ struct EncoderBuild {
 // n_mel_frames must be positive and even (upstream pads/trims to 3000; smaller
 // even values are accepted for test fixtures). use_flash selects
 // ggml_flash_attn_ext vs. manual mul_mat + soft_max; the caller gates it
-// against backend support. backend_name is informational only.
+// against backend support. backend_name selects verified strided-query flash paths.
 EncoderBuild build_encoder_graph(ggml_context *         compute_ctx,
                                  const WhisperWeights & weights,
                                  const WhisperHParams & hp,

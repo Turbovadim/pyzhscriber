@@ -9,7 +9,7 @@
 //   2. Allocate a backend buffer for every tensor in ctx_meta on the plan's
 //      primary backend.
 //   3. Stream each tensor's bytes from the GGUF data section into its
-//      backend slot via ggml_backend_tensor_set.
+//      backend slot, directly for host-visible storage and via tensor_set otherwise.
 //
 // These functions hoist that scaffolding; per-family load() still owns the
 // model, params validation, weights catalog, fusion, and destructor wiring.
@@ -33,6 +33,10 @@ struct ggml_tensor;
 struct gguf_context;
 
 namespace transcribe::load_common {
+
+// True only for CPU and shared Metal storage whose bytes can be read/written
+// directly. Synchronize pending backend work before CPU access.
+bool buffer_allows_direct_io(ggml_backend_buffer_t buffer);
 
 // True when `dev` is a Metal device with no simdgroup matrix multiply (below
 // MTLGPUFamilyApple7), which silently produces garbage transcripts (Handy
@@ -80,8 +84,8 @@ transcribe_status init_backends(transcribe_backend_request requested,
                                 BackendPlan &              out);
 
 // Stream every tensor in `ctx_meta` from the GGUF data section on
-// disk into its already-allocated backend buffer slot via
-// ggml_backend_tensor_set. The backend buffer must already be
+// disk into its already-allocated backend buffer slot, directly for host-visible
+// storage and via ggml_backend_tensor_set otherwise. The buffer must already be
 // allocated (typically via ggml_backend_alloc_ctx_tensors) before
 // calling this.
 //

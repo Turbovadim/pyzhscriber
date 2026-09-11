@@ -30,6 +30,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 namespace transcribe::whisper {
 
@@ -66,7 +67,8 @@ ggml_tensor * mha_encoder(ggml_context * ctx,
                           ggml_tensor *  out_b,
                           int            n_heads,
                           int            d_model,
-                          bool           use_flash) {
+                          bool           use_flash,
+                          bool           use_strided_q) {
     const int     head_dim = d_model / n_heads;
     const float   scale    = 1.0f / std::sqrt(static_cast<float>(head_dim));
     const int64_t T        = x->ne[1];
@@ -98,8 +100,10 @@ ggml_tensor * mha_encoder(ggml_context * ctx,
 
     ggml_tensor * o;
     if (use_flash) {
-        // flash_attn_ext wants q/k/v contiguous.
-        ggml_tensor * q_c = ggml_cont(ctx, q);
+        // Metal and CPU flash kernels read Q through its row/head strides.
+        // Keep K/V contiguous: Metal's partial-tile padding copies a full
+        // row stride and requires densely packed heads.
+        ggml_tensor * q_c = use_strided_q ? q : ggml_cont(ctx, q);
         ggml_tensor * k_c = ggml_cont(ctx, k);
         ggml_tensor * v_c = ggml_cont(ctx, v);
         o                 = ggml_flash_attn_ext(ctx, q_c, k_c, v_c, nullptr, scale, 0.0f, 0.0f);
@@ -156,12 +160,13 @@ ggml_tensor * build_block(ggml_context *          ctx,
                           const WhisperEncBlock & b,
                           int                     n_heads,
                           int                     d_model,
-                          bool                    use_flash) {
+                          bool                    use_flash,
+                          bool                    use_strided_q) {
     // Self-attention sublayer.
     {
         ggml_tensor * y = layer_norm(ctx, x, b.norm_attn_w, b.norm_attn_b);
         y = mha_encoder(ctx, y, b.attn_q_w, b.attn_q_b, b.attn_k_w, b.attn_v_w, b.attn_v_b, b.attn_out_w, b.attn_out_b,
-                        n_heads, d_model, use_flash);
+                        n_heads, d_model, use_flash, use_strided_q);
         x = ggml_add(ctx, x, y);
     }
     // FFN sublayer.
@@ -181,7 +186,8 @@ EncoderBuild build_encoder_graph(ggml_context *         ctx,
                                  int                    n_mel_frames,
                                  bool                   use_flash,
                                  const char *           backend_name) {
-    (void) backend_name;
+    const bool use_strided_q = backend_name != nullptr &&
+        (std::strncmp(backend_name, "MTL", 3) == 0 || std::strcmp(backend_name, "CPU") == 0);
 
     EncoderBuild eb{};
 
@@ -231,13 +237,17 @@ EncoderBuild build_encoder_graph(ggml_context *         ctx,
     x = add_conv1d_bias(ctx, x, w.enc_stem.conv0_b);
     // HF Whisper uses exact-erf GELU for conv stems and FFN; ggml_gelu is tanh.
     x = ggml_gelu_erf(ctx, x);
-    x = ggml_cont(ctx, ggml_transpose(ctx, x));  // -> [d_model, T]
-    named(x, "enc.conv1.out");
-    eb.dumps.conv1_out = x;
-    transcribe::debug::mark_tensor_for_dump(x);
+    // Both convolutions use [T, channels]. Materialize the channel-first
+    // intermediate only for dumps, avoiding two full transposes otherwise.
+    eb.dumps.conv1_out = ggml_transpose(ctx, x);  // -> [d_model, T]
+    if (transcribe::debug::enabled()) {
+        eb.dumps.conv1_out = ggml_cont(ctx, eb.dumps.conv1_out);
+        x = ggml_cont(ctx, ggml_transpose(ctx, eb.dumps.conv1_out));
+    }
+    named(eb.dumps.conv1_out, "enc.conv1.out");
+    transcribe::debug::mark_tensor_for_dump(eb.dumps.conv1_out);
 
     // conv2: k=3, stride=2, padding=1 -> [T_enc, d_model] (needs [T, Cin]).
-    x = ggml_cont(ctx, ggml_transpose(ctx, x));
     x = conf::conv_1d_f32(ctx, w.enc_stem.conv1_w, x, 2, 1, 1);
     x = add_conv1d_bias(ctx, x, w.enc_stem.conv1_b);
     x = ggml_gelu_erf(ctx, x);
@@ -265,7 +275,7 @@ EncoderBuild build_encoder_graph(ggml_context *         ctx,
     const int n_blocks = static_cast<int>(w.enc_blocks.size());
     eb.dumps.block_outs.reserve(static_cast<size_t>(n_blocks));
     for (int i = 0; i < n_blocks; ++i) {
-        x = build_block(ctx, x, w.enc_blocks[i], n_heads, d_model, use_flash);
+        x = build_block(ctx, x, w.enc_blocks[i], n_heads, d_model, use_flash, use_strided_q);
 
         // Name every block for layer-by-layer comparison. block0 / block_last
         // are stashed separately for callers that only want the spot-check pair.

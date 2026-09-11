@@ -1591,7 +1591,7 @@ static bool ggml_metal_buffer_rset_init(ggml_metal_buffer_t buf) {
         desc.label = @"ggml_metal";
         desc.initialCapacity = buf->n_buffers;
 
-        NSError * error;
+        NSError * error = nil;
         buf->rset = [buf->dev->mtl_device newResidencySetWithDescriptor:desc error:&error];
         if (error) {
             GGML_LOG_ERROR("%s: error: %s\n", __func__, [[error description] UTF8String]);
@@ -1723,6 +1723,9 @@ ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size,
 
 ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, size_t size, size_t max_tensor_size) {
     ggml_metal_buffer_t res = calloc(1, sizeof(struct ggml_metal_buffer));
+    if (res == NULL) {
+        return NULL;
+    }
 
     res->dev = dev;
 
@@ -1807,6 +1810,10 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
 
     if (!ggml_metal_buffer_rset_init(res)) {
         GGML_LOG_ERROR("%s: error: failed to initialize residency set\n", __func__);
+        for (int i = 0; i < res->n_buffers; ++i) {
+            [res->buffers[i].metal release];
+        }
+        ggml_metal_buffer_rset_free(res);
         free(res);
         return NULL;
     }

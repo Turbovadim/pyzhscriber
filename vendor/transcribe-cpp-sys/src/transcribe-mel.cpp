@@ -21,7 +21,8 @@
 //   * Normalize epsilon: 1e-5 (NeMo CONSTANT).
 //   * Dither: never applied (NeMo gates it on self.training).
 //
-// Output: [num_mels, n_frames] row-major float32; backend-free.
+// Output: float32, channel-major by default or frame-major on request;
+// backend-free.
 
 #include "transcribe-mel.h"
 
@@ -36,6 +37,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <limits>
 #include <thread>
@@ -346,10 +348,14 @@ transcribe_status MelFrontend::compute(const float *        pcm,
                                        std::vector<float> & out_mel,
                                        int &                out_n_mels,
                                        int &                out_n_frames,
-                                       int                  n_threads) const {
-    if (pcm == nullptr) {
+                                       int                  n_threads,
+                                       MelLayout            layout,
+                                       size_t               min_samples) const {
+    if (pcm == nullptr || n_samples == 0) {
         return TRANSCRIBE_ERR_INVALID_ARG;
     }
+    const size_t input_samples = n_samples;
+    n_samples = std::max(n_samples, min_samples);
     const int  n_fft  = cfg_.n_fft;
     const int  hop    = cfg_.hop_length;
     const int  n_mels = cfg_.num_mels;
@@ -378,38 +384,54 @@ transcribe_status MelFrontend::compute(const float *        pcm,
     // FFT routines are fp64-native.
     const bool n_fft_is_pow2 = ((n_fft > 0) && ((n_fft & (n_fft - 1)) == 0));
 
+    const auto pcm_address = reinterpret_cast<uintptr_t>(pcm);
+    const auto output_address = reinterpret_cast<uintptr_t>(out_mel.data());
+    const bool input_in_output = !out_mel.empty() && pcm_address >= output_address &&
+                                  pcm_address - output_address < out_mel.size() * sizeof(float);
+    // Whisper can borrow unextended PCM without pre-emphasis. Keep a copy
+    // when output resizing could invalidate the input or padding is needed.
+    const bool borrow_pcm = !n_fft_is_pow2 && !no_pad && cfg_.pre_emphasis == 0.0f &&
+                            input_samples == n_samples &&
+                            layout == MelLayout::FrameMajor &&
+                            (cfg_.normalize == "per_utterance" || cfg_.normalize == "global") && !input_in_output;
+
     std::vector<float>  padded_f32;
     std::vector<float>  window_f32;
     std::vector<double> padded;
 
     if (!n_fft_is_pow2) {
-        // FP32 path: pre-emphasis (or copy) directly into the middle of
-        // padded_f32, then reflect/zero-pad in place. window_ is
-        // downcast once for the worker.
-        padded_f32.resize(n_samples + 2 * static_cast<size_t>(pad));
-        if (cfg_.pre_emphasis != 0.0f) {
-            const float alpha = cfg_.pre_emphasis;
-            padded_f32[pad]   = pcm[0];
-            for (size_t i = 1; i < n_samples; ++i) {
-                padded_f32[pad + i] = pcm[i] - alpha * pcm[i - 1];
+        // Other FP32 configurations still pre-emphasize/copy and pad the
+        // input. The window is downcast once for the worker in both paths.
+        if (!borrow_pcm) {
+            padded_f32.resize(n_samples + 2 * static_cast<size_t>(pad));
+            if (cfg_.pre_emphasis != 0.0f) {
+                const float alpha = cfg_.pre_emphasis;
+                padded_f32[pad]   = pcm[0];
+                for (size_t i = 1; i < input_samples; ++i) {
+                    padded_f32[pad + i] = pcm[i] - alpha * pcm[i - 1];
+                }
+                for (size_t i = input_samples; i < n_samples; ++i) {
+                    const float previous = i == input_samples ? pcm[i - 1] : 0.0f;
+                    padded_f32[pad + i] = 0.0f - alpha * previous;
+                }
+            } else {
+                std::memcpy(padded_f32.data() + pad, pcm, input_samples * sizeof(float));
             }
-        } else {
-            std::memcpy(padded_f32.data() + pad, pcm, n_samples * sizeof(float));
-        }
-        if (use_reflect) {
-            // padded[i] = src[pad - i] for i in [0, pad). After writing
-            // src into padded_f32[pad..pad+n_samples), this becomes
-            // padded_f32[i] = padded_f32[2*pad - i].
-            for (int i = 0; i < pad; ++i) {
-                padded_f32[i] = padded_f32[2 * pad - i];
+            if (use_reflect) {
+                // padded[i] = src[pad - i] for i in [0, pad). After writing
+                // src into padded_f32[pad..pad+n_samples), this becomes
+                // padded_f32[i] = padded_f32[2*pad - i].
+                for (int i = 0; i < pad; ++i) {
+                    padded_f32[i] = padded_f32[2 * pad - i];
+                }
+                for (int i = 0; i < pad; ++i) {
+                    padded_f32[static_cast<size_t>(pad) + n_samples + i] =
+                        padded_f32[static_cast<size_t>(pad) + n_samples - 2 - i];
+                }
+            } else {
+                std::memset(padded_f32.data(), 0, static_cast<size_t>(pad) * sizeof(float));
+                std::memset(padded_f32.data() + pad + n_samples, 0, static_cast<size_t>(pad) * sizeof(float));
             }
-            for (int i = 0; i < pad; ++i) {
-                padded_f32[static_cast<size_t>(pad) + n_samples + i] =
-                    padded_f32[static_cast<size_t>(pad) + n_samples - 2 - i];
-            }
-        } else {
-            std::memset(padded_f32.data(), 0, static_cast<size_t>(pad) * sizeof(float));
-            std::memset(padded_f32.data() + pad + n_samples, 0, static_cast<size_t>(pad) * sizeof(float));
         }
 
         window_f32.resize(n_fft);
@@ -423,11 +445,15 @@ transcribe_status MelFrontend::compute(const float *        pcm,
         if (cfg_.pre_emphasis != 0.0f) {
             const double alpha = static_cast<double>(cfg_.pre_emphasis);
             emph[0]            = static_cast<double>(pcm[0]);
-            for (size_t i = 1; i < n_samples; ++i) {
+            for (size_t i = 1; i < input_samples; ++i) {
                 emph[i] = static_cast<double>(pcm[i]) - alpha * static_cast<double>(pcm[i - 1]);
             }
+            for (size_t i = input_samples; i < n_samples; ++i) {
+                const double previous = i == input_samples ? static_cast<double>(pcm[i - 1]) : 0.0;
+                emph[i] = 0.0 - alpha * previous;
+            }
         } else {
-            for (size_t i = 0; i < n_samples; ++i) {
+            for (size_t i = 0; i < input_samples; ++i) {
                 emph[i] = static_cast<double>(pcm[i]);
             }
         }
@@ -460,8 +486,8 @@ transcribe_status MelFrontend::compute(const float *        pcm,
 
     // ---- 3. STFT + mel filterbank matmul + log ----
     //
-    // Output: log_mel[n_mels, n_frames] row-major float32. Two paths by
-    // n_fft factorization:
+    // Raw log-mel is channel-major except for the direct frame-major
+    // Whisper path. Two paths by n_fft factorization:
     //
     //   non-pow2 (Whisper, Qwen3-ASR): FFT worker fuses the per-frame mel
     //     matmul + log directly into log_mel (no shared power[]), matmul
@@ -475,16 +501,24 @@ transcribe_status MelFrontend::compute(const float *        pcm,
     // log mode (whisper_mode): per_utterance writes log10(max(x, 1e-10));
     // per_feature writes log(x + 2^-24) (natural log; base is irrelevant
     // to the per-bin mean/std normalize that follows).
-    std::vector<float> log_mel(static_cast<size_t>(n_mels) * static_cast<size_t>(n_frames));
-
     const bool whisper_mode = (cfg_.normalize == "per_utterance" || cfg_.normalize == "global");
+    const bool frame_major = layout == MelLayout::FrameMajor;
+    const bool direct_output = frame_major && !n_fft_is_pow2 && whisper_mode;
+    // These normalization modes discard the last centered STFT frame.
+    const int computed_frames = direct_output ? n_frames - 1 : n_frames;
+    if (computed_frames <= 0) {
+        return TRANSCRIBE_ERR_INVALID_ARG;
+    }
+    std::vector<float> log_mel_storage;
+    std::vector<float> & log_mel = direct_output ? out_mel : log_mel_storage;
+    log_mel.resize(static_cast<size_t>(n_mels) * static_cast<size_t>(computed_frames));
 
     int stft_threads = n_threads;
     if (stft_threads <= 0) {
         stft_threads = default_n_threads();
     }
-    if (stft_threads > n_frames) {
-        stft_threads = std::max(1, n_frames);
+    if (stft_threads > computed_frames) {
+        stft_threads = std::max(1, computed_frames);
     }
 
     // Per-thread worker dispatcher. Strided frame assignment (stride =
@@ -507,6 +541,15 @@ transcribe_status MelFrontend::compute(const float *        pcm,
     };
 
     if (!n_fft_is_pow2) {
+        // A zero window has zero power in every FFT bin. Preserve the log
+        // floor exactly while avoiding FFTs and filterbank products for
+        // silence, including Whisper's padding to a 30-second window.
+        // Non-finite checkpoint filters must keep the original arithmetic.
+        const bool finite_filterbank = std::all_of(mel_fb_.begin(), mel_fb_.end(),
+                                                   [](float value) { return std::isfinite(value); });
+        const float silent_log_mel = whisper_mode ? static_cast<float>(std::log10(1.0e-10))
+                                                  : static_cast<float>(std::log(static_cast<double>(kLogEps)));
+
         // Fused worker: window mul → mixed-radix FFT → power → mel
         // matmul + log → log_mel, all fp32, all per-frame on this thread.
         // Matmul uses a 4-way-unrolled fp64 accumulator for numerical
@@ -515,10 +558,38 @@ transcribe_status MelFrontend::compute(const float *        pcm,
             std::vector<float> fft_in(2 * static_cast<size_t>(n_fft), 0.0f);
             std::vector<float> fft_out(8 * static_cast<size_t>(n_fft), 0.0f);
             std::vector<float> power_scratch(static_cast<size_t>(n_freq));
-            for (int t = tid; t < n_frames; t += stft_threads) {
+            for (int t = tid; t < computed_frames; t += stft_threads) {
                 const size_t start = static_cast<size_t>(t) * static_cast<size_t>(hop);
-                for (int n = 0; n < n_fft; ++n) {
-                    fft_in[n] = padded_f32[start + n] * window_f32[n];
+                const float * frame = borrow_pcm ? nullptr : padded_f32.data() + start;
+                if (borrow_pcm && start >= static_cast<size_t>(pad) && input_samples >= static_cast<size_t>(n_fft) &&
+                    start - static_cast<size_t>(pad) <= input_samples - static_cast<size_t>(n_fft)) {
+                    frame = pcm + start - static_cast<size_t>(pad);
+                }
+                bool all_zero = true;
+                if (frame != nullptr) {
+                    for (int n = 0; n < n_fft; ++n) {
+                        fft_in[n] = frame[n] * window_f32[n];
+                        all_zero &= (fft_in[n] == 0.0f);
+                    }
+                } else {
+                    // Only boundary windows need reflected or zero samples.
+                    for (int n = 0; n < n_fft; ++n) {
+                        int64_t index = static_cast<int64_t>(start) + n - pad;
+                        if (use_reflect) {
+                            if (index < 0) index = -index;
+                            else if (index >= static_cast<int64_t>(n_samples)) index = 2 * static_cast<int64_t>(n_samples) - 2 - index;
+                        }
+                        const float value = index >= 0 && static_cast<size_t>(index) < input_samples ? pcm[index] : 0.0f;
+                        fft_in[n] = value * window_f32[n];
+                        all_zero &= (fft_in[n] == 0.0f);
+                    }
+                }
+                if (all_zero && finite_filterbank) {
+                    for (int m = 0; m < n_mels; ++m) {
+                        log_mel[direct_output ? static_cast<size_t>(t) * n_mels + m
+                                              : static_cast<size_t>(m) * n_frames + t] = silent_log_mel;
+                    }
+                    continue;
                 }
                 mixed_radix_fft_f32(fft_in.data(), n_fft, cos_lut_.data(), sin_lut_.data(),
                                     static_cast<int>(cos_lut_.size()), fft_out.data());
@@ -549,7 +620,8 @@ transcribe_status MelFrontend::compute(const float *        pcm,
                     } else {
                         result = static_cast<float>(std::log(sum + static_cast<double>(kLogEps)));
                     }
-                    log_mel[static_cast<size_t>(m) * n_frames + t] = result;
+                    log_mel[direct_output ? static_cast<size_t>(t) * n_mels + m
+                                          : static_cast<size_t>(m) * n_frames + t] = result;
                 }
             }
         };
@@ -701,6 +773,18 @@ transcribe_status MelFrontend::compute(const float *        pcm,
     std::vector<float>().swap(padded_f32);
     std::vector<float>().swap(window_f32);
 
+    auto normalize_direct_output = [&](double floor_val) {
+        for (float & value : out_mel) {
+            double v = static_cast<double>(value);
+            if (v < floor_val) {
+                v = floor_val;
+            }
+            value = static_cast<float>((v + 4.0) / 4.0);
+        }
+        out_n_mels = n_mels;
+        out_n_frames = computed_frames;
+    };
+
     // ---- 5n. No-op normalize (NeMo "NA"/none) ----
     // Emit raw log-mel as-is: streaming Conformer variants (e.g.
     // nemotron-speech-streaming-en-0.6b) bake feature normalization into
@@ -715,7 +799,16 @@ transcribe_status MelFrontend::compute(const float *        pcm,
     // sees a real log-mel value there and the drift dominates the early
     // pre_encode output (max_abs ~13 on that single frame).
     if (cfg_.normalize == "none") {
-        out_mel      = std::move(log_mel);
+        if (frame_major) {
+            out_mel.resize(log_mel.size());
+            for (int t = 0; t < n_frames; ++t) {
+                for (int m = 0; m < n_mels; ++m) {
+                    out_mel[static_cast<size_t>(t) * n_mels + m] = log_mel[static_cast<size_t>(m) * n_frames + t];
+                }
+            }
+        } else {
+            out_mel = std::move(log_mel);
+        }
         out_n_mels   = n_mels;
         out_n_frames = n_frames;
         // pad_mode="none" emits exactly (n - win)/hop + 1 frames with no
@@ -725,9 +818,9 @@ transcribe_status MelFrontend::compute(const float *        pcm,
         if (!no_pad) {
             const int valid = static_cast<int>(n_samples / static_cast<size_t>(cfg_.hop_length));
             for (int m = 0; m < n_mels; ++m) {
-                float * row = out_mel.data() + static_cast<size_t>(m) * n_frames;
+                float * row = out_mel.data() + (frame_major ? m : static_cast<size_t>(m) * n_frames);
                 for (int t = valid; t < n_frames; ++t) {
-                    row[t] = 0.0f;
+                    row[static_cast<size_t>(t) * (frame_major ? n_mels : 1)] = 0.0f;
                 }
             }
         }
@@ -745,27 +838,42 @@ transcribe_status MelFrontend::compute(const float *        pcm,
         }
 
         double global_max = -std::numeric_limits<double>::infinity();
-        for (int m = 0; m < n_mels; ++m) {
-            const float * src = log_mel.data() + static_cast<size_t>(m) * n_frames;
-            for (int t = 0; t < n_out; ++t) {
-                const double v = static_cast<double>(src[t]);
+        if (direct_output) {
+            // A maximum is order-independent except for signed-zero ties;
+            // subtracting eight below gives the same floor for either sign.
+            for (float value : log_mel) {
+                const double v = static_cast<double>(value);
                 if (v > global_max) {
                     global_max = v;
                 }
             }
+        } else {
+            for (int m = 0; m < n_mels; ++m) {
+                const float * src = log_mel.data() + static_cast<size_t>(m) * n_frames;
+                for (int t = 0; t < n_out; ++t) {
+                    const double v = static_cast<double>(src[t]);
+                    if (v > global_max) {
+                        global_max = v;
+                    }
+                }
+            }
         }
         const double floor_val = global_max - 8.0;
+        if (direct_output) {
+            normalize_direct_output(floor_val);
+            return TRANSCRIBE_OK;
+        }
 
         out_mel.resize(static_cast<size_t>(n_mels) * static_cast<size_t>(n_out));
         for (int m = 0; m < n_mels; ++m) {
             const float * src = log_mel.data() + static_cast<size_t>(m) * n_frames;
-            float *       dst = out_mel.data() + static_cast<size_t>(m) * n_out;
+            float *       dst = out_mel.data() + (frame_major ? m : static_cast<size_t>(m) * n_out);
             for (int t = 0; t < n_out; ++t) {
                 double v = static_cast<double>(src[t]);
                 if (v < floor_val) {
                     v = floor_val;
                 }
-                dst[t] = static_cast<float>((v + 4.0) / 4.0);
+                dst[static_cast<size_t>(t) * (frame_major ? n_mels : 1)] = static_cast<float>((v + 4.0) / 4.0);
             }
         }
 
@@ -784,17 +892,21 @@ transcribe_status MelFrontend::compute(const float *        pcm,
             return TRANSCRIBE_ERR_INVALID_ARG;
         }
         const double floor_val = static_cast<double>(cfg_.global_log_mel_max) - 8.0;
+        if (direct_output) {
+            normalize_direct_output(floor_val);
+            return TRANSCRIBE_OK;
+        }
 
         out_mel.resize(static_cast<size_t>(n_mels) * static_cast<size_t>(n_out));
         for (int m = 0; m < n_mels; ++m) {
             const float * src = log_mel.data() + static_cast<size_t>(m) * n_frames;
-            float *       dst = out_mel.data() + static_cast<size_t>(m) * n_out;
+            float *       dst = out_mel.data() + (frame_major ? m : static_cast<size_t>(m) * n_out);
             for (int t = 0; t < n_out; ++t) {
                 double v = static_cast<double>(src[t]);
                 if (v < floor_val) {
                     v = floor_val;
                 }
-                dst[t] = static_cast<float>((v + 4.0) / 4.0);
+                dst[static_cast<size_t>(t) * (frame_major ? n_mels : 1)] = static_cast<float>((v + 4.0) / 4.0);
             }
         }
         out_n_mels   = n_mels;
@@ -827,7 +939,7 @@ transcribe_status MelFrontend::compute(const float *        pcm,
     out_mel.resize(static_cast<size_t>(n_mels) * static_cast<size_t>(n_frames));
     for (int m = 0; m < n_mels; ++m) {
         const float * src = log_mel.data() + static_cast<size_t>(m) * n_frames;
-        float *       dst = out_mel.data() + static_cast<size_t>(m) * n_frames;
+        float *       dst = out_mel.data() + (frame_major ? m : static_cast<size_t>(m) * n_frames);
 
         double sum = 0.0;
         for (int t = 0; t < n_norm; ++t) {
@@ -845,12 +957,12 @@ transcribe_status MelFrontend::compute(const float *        pcm,
         const double inv    = 1.0 / (stddev + static_cast<double>(kNormEps));
 
         for (int t = 0; t < n_norm; ++t) {
-            dst[t] = static_cast<float>((static_cast<double>(src[t]) - mean) * inv);
+            dst[static_cast<size_t>(t) * (frame_major ? n_mels : 1)] = static_cast<float>((static_cast<double>(src[t]) - mean) * inv);
         }
 
         // Zero the last frame when it's a padding artifact.
         if (mask_last) {
-            dst[n_norm] = 0.0f;
+            dst[static_cast<size_t>(n_norm) * (frame_major ? n_mels : 1)] = 0.0f;
         }
     }
 

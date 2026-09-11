@@ -14,6 +14,49 @@ struct WhisperCoreMlContext {
 
 namespace {
 
+// Offer the caller's storage to Core ML. Some execution plans keep their own
+// output allocation, so predict() still copies when this backing is ignored.
+MLMultiArray * make_output_backing(MLModel * model, float * output, size_t output_elements) {
+    if (output == nullptr || output_elements == 0) {
+        return nil;
+    }
+
+    MLFeatureDescription * description = model.modelDescription.outputDescriptionsByName[@"output"];
+    MLMultiArrayConstraint * constraint = description.multiArrayConstraint;
+    NSArray<NSNumber *> * shape = constraint.shape;
+    if (constraint.dataType != MLMultiArrayDataTypeFloat32 || shape.count == 0) {
+        return nil;
+    }
+
+    // Use the model's declared shape, including any singleton dimensions,
+    // while retaining the existing contiguous encoder output layout.
+    size_t count = 1;
+    NSMutableArray<NSNumber *> * strides = [NSMutableArray arrayWithCapacity:shape.count];
+    for (NSUInteger i = shape.count; i > 0; --i) {
+        const NSInteger dimension = shape[i - 1].integerValue;
+        if (dimension <= 0 || static_cast<size_t>(dimension) > output_elements / count) {
+            return nil;
+        }
+        [strides insertObject:@(count) atIndex:0];
+        count *= static_cast<size_t>(dimension);
+    }
+    if (count != output_elements) {
+        return nil;
+    }
+
+    NSError * error = nil;
+    MLMultiArray * backing = [[MLMultiArray alloc] initWithDataPointer:output
+                                                               shape:shape
+                                                            dataType:MLMultiArrayDataTypeFloat32
+                                                             strides:strides
+                                                         deallocator:nil
+                                                               error:&error];
+    if (backing == nil || ![description isAllowedValue:[MLFeatureValue featureValueWithMultiArray:backing]]) {
+        return nil;
+    }
+    return backing;
+}
+
 bool predict(MLModel *     model,
              int64_t       n_mel_frames,
              int64_t       n_mels,
@@ -47,7 +90,20 @@ bool predict(MLModel *     model,
         return false;
     }
 
-    id<MLFeatureProvider> features = [model predictionFromFeatures:provider error:&error];
+    MLPredictionOptions * options = [[MLPredictionOptions alloc] init];
+    MLMultiArray * output_backing = nil;
+    if (@available(macOS 11.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)) {
+        output_backing = make_output_backing(model, output, output_elements);
+        if (output_backing != nil) {
+            options.outputBackings = @{@"output": output_backing};
+        }
+    }
+
+    id<MLFeatureProvider> features = [model predictionFromFeatures:provider options:options error:&error];
+    if (features == nil && output_backing != nil) {
+        // A model that rejects caller-owned storage can still run normally.
+        features = [model predictionFromFeatures:provider error:&error];
+    }
     if (features == nil) {
         log_msg(TRANSCRIBE_LOG_LEVEL_WARN, "whisper Core ML: prediction failed: %s",
                 error.description.UTF8String);
@@ -63,7 +119,7 @@ bool predict(MLModel *     model,
         return false;
     }
 
-    if (output != nullptr) {
+    if (output != nullptr && encoded.dataPointer != output) {
         std::memcpy(output, encoded.dataPointer, output_elements * sizeof(float));
     }
     return true;

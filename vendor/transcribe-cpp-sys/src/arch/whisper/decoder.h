@@ -6,8 +6,8 @@
 //
 // Two graph families:
 //   1. build_decoder_prefill_graph() — non-cached, used only for language
-//      detection (SOT-only forward on the first chunk before the cross-KV
-//      cache exists); cross-K/V recomputed inside the graph.
+//      detection (SOT-only forward on the first chunk); cross-K/V are F32
+//      projections inside the graph and may also populate the cross cache.
 //   2. build_cross_kv_graph() + build_decoder_graph_kv() — KV-cached
 //      production path. Cross-K/V precomputed once per chunk; self-K/V written
 //      per step. One graph handles both prompt pass (n_tokens>1, n_past=0) and
@@ -54,7 +54,8 @@ struct DecoderBuild {
     // padded slots do not contribute to the cross-attn output.
     ggml_tensor * cross_mask_in = nullptr;
 
-    // Output: log-softmax logits [vocab_size, seq_len].
+    // Output: logits [output_vocab, output_rows]. These cover the full
+    // vocabulary and sequence unless the builder receives a selection.
     ggml_tensor * out = nullptr;
 
     DecoderDumps  dumps{};
@@ -64,12 +65,28 @@ struct DecoderBuild {
 // Build a decoder prefill graph in compute_ctx (no KV cache). Used
 // only by the language-detection forward pass on the first chunk;
 // every other decoder forward goes through build_decoder_graph_kv.
+// If encoder_out is provided, its backend storage is read through a view;
+// encoder_out_in then needs no upload. Otherwise it remains a graph input.
+// skip_log_softmax emits raw logits. vocab_begin/vocab_count restrict the head
+// to a contiguous vocabulary range, preserving the original weight dtype.
+// A zero vocab_count selects all rows from vocab_begin to the vocabulary end.
+// When requested with a range, log-softmax normalizes over that range only.
+// Defaults retain the full reference graph for debug dumps.
+// An optional cross_cache receives the existing F32 K/V projections as a
+// side effect; attention still reads the original F32 tensors. Initialize a
+// single-utterance cache for T_enc first, and mark it populated only after
+// this graph computes successfully. Self-attention cache is not modified.
 DecoderBuild build_decoder_prefill_graph(ggml_context *         compute_ctx,
                                          const WhisperWeights & weights,
                                          const WhisperHParams & hp,
                                          int                    seq_len,
                                          int                    T_enc,
-                                         bool                   use_flash = true);
+                                         bool                   use_flash = true,
+                                         ggml_tensor *          encoder_out = nullptr,
+                                         bool                   skip_log_softmax = false,
+                                         int                    vocab_begin = 0,
+                                         int                    vocab_count = 0,
+                                         WhisperKvCache *       cross_cache = nullptr);
 
 // Build a graph that computes cross-attention K/V for every decoder
 // layer from the encoder output and writes them into the cross-attn
@@ -102,6 +119,11 @@ DecoderBuild build_cross_kv_graph(ggml_context *         compute_ctx,
 // effective n_kv is rounded up to a multiple of kv_pad, and the
 // caller-supplied causal_mask_in covers the trailing padded slots
 // with -inf so they do not contribute to the FA output.
+//
+// logits_rows selects which token positions reach the vocabulary projection,
+// in the given order. An empty selection retains all n_tokens rows. Production
+// prefill needs only the SOT row for no-speech detection and the last row for
+// generation; retaining all rows is useful for reference dumps.
 DecoderBuild build_decoder_graph_kv(ggml_context *         compute_ctx,
                                     const WhisperWeights & weights,
                                     const WhisperHParams & hp,
@@ -111,7 +133,8 @@ DecoderBuild build_decoder_graph_kv(ggml_context *         compute_ctx,
                                     int                    T_enc,
                                     int                    kv_pad           = 1,
                                     bool                   skip_log_softmax = false,
-                                    bool                   use_flash        = true);
+                                    bool                   use_flash        = true,
+                                    const std::vector<int32_t> & logits_rows = {});
 
 // Static-topology single-token decoder graph. Built once per tier
 // after the prompt pass and reused for every step in the tier's
