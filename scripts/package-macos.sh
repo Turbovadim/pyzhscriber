@@ -13,6 +13,7 @@ VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$PROJECT_DIR/Cargo.toml" | he
 export SDKROOT="${SDKROOT:-$(xcrun --sdk macosx --show-sdk-path)}"
 export CC="${CC:-$(xcrun --find clang)}"
 export CXX="${CXX:-$(xcrun --find clang++)}"
+export CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER="${CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER:-$CC}"
 export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-13.0}"
 DIST_DIR="$PROJECT_DIR/dist"
 APP_DIR="$DIST_DIR/Pyzhscriber.app"
