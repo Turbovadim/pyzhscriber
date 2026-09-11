@@ -9,6 +9,11 @@ if [[ "$PACKAGE_MODE" != install && "$PACKAGE_MODE" != --dmg ]]; then
   exit 1
 fi
 VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$PROJECT_DIR/Cargo.toml" | head -n 1)"
+# Keep native dependencies on the same Xcode SDK and deployment target as the app.
+export SDKROOT="${SDKROOT:-$(xcrun --sdk macosx --show-sdk-path)}"
+export CC="${CC:-$(xcrun --find clang)}"
+export CXX="${CXX:-$(xcrun --find clang++)}"
+export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-13.0}"
 DIST_DIR="$PROJECT_DIR/dist"
 APP_DIR="$DIST_DIR/Pyzhscriber.app"
 CONTENTS_DIR="$APP_DIR/Contents"
@@ -74,7 +79,7 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>CFBundleVersion</key><string>$VERSION</string>
-  <key>LSMinimumSystemVersion</key><string>13.0</string>
+  <key>LSMinimumSystemVersion</key><string>$MACOSX_DEPLOYMENT_TARGET</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSMicrophoneUsageDescription</key><string>Pyzhscriber records speech only while the transcription shortcut is held.</string>
   <key>NSPrincipalClass</key><string>NSApplication</string>
