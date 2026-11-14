@@ -1041,7 +1041,11 @@ impl RootView {
                     .relative()
                     .size(px(16.0))
                     .rounded_full()
-                    .bg(theme::text())
+                    .bg(if enabled {
+                        theme::background()
+                    } else {
+                        theme::text()
+                    })
                     .with_spring(
                         SharedString::from(format!("{id}-thumb-spring")),
                         SpringAnimation::new(SpringConfig::new(520.0, 34.0, 1.0))

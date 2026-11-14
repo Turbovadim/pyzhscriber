@@ -1,19 +1,19 @@
 use gpui::{Hsla, rgb};
 
 pub fn background() -> Hsla {
-    rgb(0x20202a).into()
+    rgb(0x191a22).into()
 }
 
 pub fn raised() -> Hsla {
-    rgb(0x292936).into()
+    rgb(0x21232e).into()
 }
 
 pub fn hover() -> Hsla {
-    rgb(0x37374a).into()
+    rgb(0x323546).into()
 }
 
 pub fn border() -> Hsla {
-    rgb(0x49495f).into()
+    rgb(0x444860).into()
 }
 
 pub fn text() -> Hsla {
@@ -25,19 +25,19 @@ pub fn muted() -> Hsla {
 }
 
 pub fn accent() -> Hsla {
-    rgb(0xeb84bc).into()
+    rgb(0x7cf5c4).into()
 }
 
 pub fn accent_dim() -> Hsla {
-    rgb(0x62475e).into()
+    rgb(0x244a44).into()
 }
 
 pub fn input() -> Hsla {
-    rgb(0x313141).into()
+    rgb(0x292b38).into()
 }
 
 pub fn success() -> Hsla {
-    rgb(0x6fd3a0).into()
+    rgb(0x4cc9f0).into()
 }
 
 pub fn danger() -> Hsla {
