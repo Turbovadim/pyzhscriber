@@ -31,6 +31,29 @@ pub fn prompt(_title: &str, _detail: &str, _value: &str, _secret: bool) -> Optio
     None
 }
 
+/// Asks before a destructive action; `action` labels the confirming button.
+#[cfg(target_os = "macos")]
+pub fn confirm(title: &str, detail: &str, action: &str) -> bool {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSAlert, NSAlertFirstButtonReturn};
+    use objc2_foundation::NSString;
+
+    let Some(mtm) = MainThreadMarker::new() else {
+        return false;
+    };
+    let alert = NSAlert::new(mtm);
+    alert.setMessageText(&NSString::from_str(title));
+    alert.setInformativeText(&NSString::from_str(detail));
+    alert.addButtonWithTitle(&NSString::from_str(action));
+    alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+    alert.runModal() == NSAlertFirstButtonReturn
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn confirm(_title: &str, _detail: &str, _action: &str) -> bool {
+    false
+}
+
 pub fn open_privacy_settings(section: &str) {
     #[cfg(target_os = "macos")]
     {

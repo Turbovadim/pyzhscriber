@@ -14,6 +14,7 @@
 #include "sanm/sanm.h"
 #include "sensevoice.h"
 #include "transcribe-arch.h"
+#include "transcribe-backend.h"
 #include "transcribe-batch-util.h"
 #include "transcribe-debug.h"
 #include "transcribe-kaldi-fbank.h"
@@ -42,26 +43,14 @@ extern const Arch arch;
 static_assert(std::is_base_of_v<transcribe_model, SenseVoiceModel>);
 static_assert(std::is_base_of_v<transcribe_session, SenseVoiceSession>);
 
-SenseVoiceSession::~SenseVoiceSession() {
-    if (sched != nullptr) {
-        safe_sched_free(sched);
-        sched = nullptr;
-    }
-    if (compute_ctx != nullptr) {
-        ggml_free(compute_ctx);
-        compute_ctx = nullptr;
-    }
-}
+SenseVoiceSession::~SenseVoiceSession() = default;
 
 SenseVoiceModel::~SenseVoiceModel() {
     if (ctx_meta != nullptr) {
         ggml_free(ctx_meta);
         ctx_meta = nullptr;
     }
-    if (backend_buffer != nullptr) {
-        safe_buffer_free(backend_buffer);
-        backend_buffer = nullptr;
-    }
+    weight_storage.reset();
     for (auto it = plan.scheduler_list.rbegin(); it != plan.scheduler_list.rend(); ++it) {
         safe_backend_free(*it);
     }
@@ -153,16 +142,8 @@ transcribe_status load(Loader & loader, const transcribe_model_load_params * par
     m->backend         = ggml_backend_name(m->plan.primary);
     m->primary_backend = m->plan.primary;
 
-    ggml_backend_buffer_t weights_buffer = ggml_backend_alloc_ctx_tensors(m->ctx_meta, m->plan.primary);
-    if (weights_buffer == nullptr) {
-        gguf_free(gguf_data);
-        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "sensevoice: ggml_backend_alloc_ctx_tensors failed");
-        return TRANSCRIBE_ERR_GGUF;
-    }
-    m->backend_buffer = weights_buffer;
-    ggml_backend_buffer_set_usage(weights_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-
-    if (auto st = transcribe::load_common::stream_tensor_data(loader.path(), gguf_data, m->ctx_meta, "sensevoice");
+    if (const transcribe_status st = transcribe::load_common::load_weights(
+            loader.path(), gguf_data, m->ctx_meta, m->plan, params, "sensevoice", m->weight_storage);
         st != TRANSCRIBE_OK) {
         gguf_free(gguf_data);
         return st;
@@ -471,15 +452,12 @@ transcribe_status run(transcribe_session *          session,
                                            static_cast<int>(cm->plan.scheduler_list.size()),
                                            /*graph_size=*/8192, /*parallel=*/false, /*op_offload=*/true);
         if (cc->sched == nullptr) {
-            transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
-                                "sensevoice run: scheduler allocation failed — out of memory. "
-                                "Split long audio into shorter segments (see "
-                                "transcribe_capabilities.max_audio_ms).");
-            return TRANSCRIBE_ERR_OOM;
+            transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "sensevoice run: ggml_backend_sched_new failed");
+            return TRANSCRIBE_ERR_BACKEND;
         }
     }
     ggml_backend_sched_reset(cc->sched);
-    if (!ggml_backend_sched_alloc_graph(cc->sched, eb.graph)) {
+    if (!TRANSCRIBE_ALLOC_SCHED_GRAPH(cc->sched, eb.graph, "sensevoice")) {
         transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
                             "sensevoice run: encoder graph allocation failed — out of memory. "
                             "Split long audio into shorter segments (see "
@@ -498,16 +476,30 @@ transcribe_status run(transcribe_session *          session,
     const int32_t event_emo[2] = { 1, 2 };  // literal indices in the embed table
 
     // ITN slot. Generic transcribe_run_params::itn routes here. DEFAULT maps
-    // to the shipped behavior (use_itn=false; matches the family's
-    // `itn=False` Python default). OFF / ON override explicitly. The
-    // dispatcher's advisory WARN only fires when transcribe_model_supports(
+    // to ITN ON — a deliberate divergence from upstream's `itn=False` Python
+    // default. SenseVoice has no separate PNC toggle, so the textnorm prefix
+    // is the only control that yields casing and punctuation; with it off the
+    // out-of-the-box transcript is lowercase and unpunctuated. OFF recovers
+    // the upstream spoken-form output verbatim.
+    //
+    // ITN changes the CTC decode, not just the rendering, so it moves accuracy:
+    // +0.110pp WER on LibriSpeech test-clean at F32, but -2.03pp CER on
+    // FLEURS-zh (the zh reference is digit-normalized, so ITN-on matches its
+    // convention). The English cost is upstream's, not ours: the FunASR 1.3.1
+    // reference shows +0.147pp on the same data and corrupts the same words
+    // byte-for-byte. The published tables are
+    // unaffected because scripts/wer/run.py and scripts/validate.py both pin
+    // `--no-itn`, so they keep measuring the same text the ITN-off reference
+    // produces. See docs/tools/wer.md ("Methodology (pinned recipe)").
+    //
+    // The dispatcher's advisory WARN only fires when transcribe_model_supports(
     // model, TRANSCRIBE_FEATURE_ITN) is false; SenseVoice sets
     // TRANSCRIBE_FEATURE_ITN so the probe returns true and no WARN fires here.
-    bool use_itn = false;
+    bool use_itn = true;
     if (params != nullptr) {
         switch (params->itn) {
             case TRANSCRIBE_ITN_MODE_DEFAULT:
-                use_itn = false;
+                use_itn = true;
                 break;
             case TRANSCRIBE_ITN_MODE_OFF:
                 use_itn = false;
@@ -540,7 +532,7 @@ transcribe_status run(transcribe_session *          session,
     const int64_t t_enc_start = ggml_time_us();
     if (const ggml_status gs = ggml_backend_sched_graph_compute(cc->sched, eb.graph); gs != GGML_STATUS_SUCCESS) {
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "sensevoice run: graph compute failed (%d)", static_cast<int>(gs));
-        return TRANSCRIBE_ERR_GGUF;
+        return TRANSCRIBE_ERR_BACKEND;
     }
     cc->t_encode_us = ggml_time_us() - t_enc_start;
 
@@ -696,15 +688,12 @@ static transcribe_status run_batch_encode(
                                            static_cast<int>(cm->plan.scheduler_list.size()),
                                            /*graph_size=*/8192, /*parallel=*/false, /*op_offload=*/true);
         if (cc->sched == nullptr) {
-            transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
-                                "sensevoice run: scheduler allocation failed — out of memory. "
-                                "Split long audio into shorter segments (see "
-                                "transcribe_capabilities.max_audio_ms).");
-            return TRANSCRIBE_ERR_OOM;
+            transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "sensevoice run: ggml_backend_sched_new failed");
+            return TRANSCRIBE_ERR_BACKEND;
         }
     }
     ggml_backend_sched_reset(cc->sched);
-    if (!ggml_backend_sched_alloc_graph(cc->sched, eb.graph)) {
+    if (!TRANSCRIBE_ALLOC_SCHED_GRAPH(cc->sched, eb.graph, "sensevoice")) {
         transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
                             "sensevoice run: encoder graph allocation failed — out of memory. "
                             "Split long audio into shorter segments (see "
@@ -718,11 +707,13 @@ static transcribe_status run_batch_encode(
     const char *  lang         = (params != nullptr) ? params->language : nullptr;
     const int32_t lid_idx      = resolve_lid_idx(hp, lang);
     const int32_t event_emo[2] = { 1, 2 };
-    bool          use_itn      = false;
+    // DEFAULT = ITN on; see the serial path above for the rationale. Kept
+    // byte-identical to that switch so batch and serial never diverge.
+    bool          use_itn      = true;
     if (params != nullptr) {
         switch (params->itn) {
             case TRANSCRIBE_ITN_MODE_DEFAULT:
-                use_itn = false;
+                use_itn = true;
                 break;
             case TRANSCRIBE_ITN_MODE_OFF:
                 use_itn = false;
@@ -769,7 +760,7 @@ static transcribe_status run_batch_encode(
     const int64_t t_enc_start = ggml_time_us();
     if (const ggml_status gs = ggml_backend_sched_graph_compute(cc->sched, eb.graph); gs != GGML_STATUS_SUCCESS) {
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "sensevoice run_batch: graph compute failed (%d)", static_cast<int>(gs));
-        return TRANSCRIBE_ERR_GGUF;
+        return TRANSCRIBE_ERR_BACKEND;
     }
     cc->t_encode_us = ggml_time_us() - t_enc_start;
 

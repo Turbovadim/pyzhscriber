@@ -18,22 +18,25 @@ required-features = ["visual-qa"]
 [dependencies]
 anyhow = "1"
 arboard = "3.6"
+base64 = "0.22"
 async-channel = "2"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 cpal = "0.16"
 dirs = "6"
 enigo = "0.6.1"
-futures-util = "0.3"
-gpui = { git = "https://github.com/zed-industries/zed", rev = "fecc3273ed32643c2ea1b04a74c8780e2c9ffaf8", default-features = false, features = ["default"] }
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "fecc3273ed32643c2ea1b04a74c8780e2c9ffaf8", features = ["font-kit", "wayland", "x11"] }
-gpui_tokio = { git = "https://github.com/zed-industries/zed", rev = "fecc3273ed32643c2ea1b04a74c8780e2c9ffaf8" }
+futures-util = { version = "0.3", features = ["sink"] }
+gpui = { git = "https://github.com/zed-industries/zed", rev = "b5cd310b3b54dfc659fcc06453e6358843dfe216", default-features = false, features = ["default"] }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "b5cd310b3b54dfc659fcc06453e6358843dfe216", features = ["font-kit", "wayland", "x11"] }
+gpui_tokio = { git = "https://github.com/zed-industries/zed", rev = "b5cd310b3b54dfc659fcc06453e6358843dfe216" }
 hound = "3.5"
 image = "0.25"
 log = "0.4"
+ogg = "0.9"
+opus = "0.4"
 parking_lot = "0.12"
 raw-window-handle = "0.6"
-reqwest = { version = "0.12", features = ["blocking", "json", "stream"] }
+reqwest = { version = "0.12", features = ["blocking", "json", "multipart", "stream"] }
 rodio = { git = "https://github.com/cjpais/rodio.git" }
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
@@ -42,12 +45,14 @@ sha2 = "0.10"
 single-instance = "0.3"
 smol = "2"
 thiserror = "2"
-tokio = { version = "1", features = ["fs", "io-util", "rt-multi-thread", "time"] }
-transcribe-cpp = { version = "0.2.0", default-features = false, features = ["metal"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "time"] }
+transcribe-cpp = { version = "0.4", default-features = false, features = ["metal"] }
 tray-icon = "0.21"
+tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"
+libc = "0.2"
 objc2 = "0.6.4"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSAlert", "NSApplication", "NSButton", "NSControl", "NSImage", "NSWindow", "NSView", "NSResponder", "NSEvent", "NSPasteboard", "NSStatusBar", "NSStatusBarButton", "NSStatusItem", "NSTextField", "NSWorkspace", "NSRunningApplication"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSProcessInfo", "NSString", "NSURL", "NSNotification", "NSObject"] }
@@ -70,3 +75,8 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
+
+# Stripped proc-macro dylibs fail to load on macOS 27 (mis-aligned LINKEDIT),
+# so only the shipped binary is stripped.
+[profile.release.build-override]
+strip = false

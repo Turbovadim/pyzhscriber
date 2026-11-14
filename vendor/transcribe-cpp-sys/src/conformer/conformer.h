@@ -102,17 +102,15 @@ struct BlockView {
 };
 
 // Per-family conv dispatch policy. direct_pw is shared (detect_direct_pw is
-// the same for every family today); direct_dw splits between the block site
-// (direct_dw_in_block: the conformer block's 1-D depthwise after GLU) and the
-// pre_encode site (direct_dw_in_pre_encode: the stride-2 2-D depthwise), since
-// the two have different shapes and per-family backend choices. Defaults are
-// conservative: direct_pw true (pointwise is direct mul_mat everywhere), both
-// direct_dw_* false (im2col), which is safe on Metal where the direct 2-D
-// depthwise kernel is not implemented for all shapes.
+// the same for every family today). The pre-encode conv0 and depthwise sites
+// have separate direct-op controls because their shapes and backend tradeoffs
+// differ from the block convolutions. Defaults keep the established im2col
+// paths except for direct_pw; families opt into direct pre-encode ops.
 struct ConvPolicy {
-    bool direct_pw               = true;
-    bool direct_dw_in_block      = false;
-    bool direct_dw_in_pre_encode = false;
+    bool direct_pw                  = true;
+    bool direct_conv0_in_pre_encode = false;
+    bool direct_dw_in_block         = false;
+    bool direct_dw_in_pre_encode    = false;
 
     // Causal pre_encode convolutions. NeMo's cache-aware streaming swaps
     // every Conv2d in ConvSubsampling for CausalConv2D, padding
@@ -124,6 +122,16 @@ struct ConvPolicy {
 
     // Let Metal's depthwise kernel read contiguous channels after the GLU.
     bool direct_dw_channel_contiguous = false;
+
+    // Where the pre_encode valid-length masks apply. false (NeMo): after each
+    // stage's ReLU. true (kestrel): right after each strided
+    // conv, so the padded tail carries ReLU(pointwise bias) into the next
+    // strided conv as the reference does. Stage 1 is the same either way.
+    bool pre_encode_mask_after_stride = false;
+
+    // Run the pre_encode pointwise convs (conv3, conv6) via conv_2d_f32.
+    // Other variants were validated on the F16 im2col and keep it.
+    bool pre_encode_f32_pointwise = false;
 };
 
 // Resolve a conv-dispatch toggle from its env overrides. The DIRECT var forces
@@ -166,8 +174,8 @@ struct BlockParams {
     //     T <= 2W+1 and remains correct (band-restricted) when T
     //     exceeds the window. Default for every offline variant.
     //
-    //   ChunkedLimited  — pos_emb stays at the full 2T-1 length and
-    //     the caller supplies a precomputed F16 mask of shape
+    //   ChunkedLimited  — pos_emb normally stays at the full 2T-1 length
+    //     and the caller supplies a precomputed F32 mask of shape
     //     [T_k, T_q, 1, 1] in `attn_chunked_mask` that
     //     rel_pos_mhsa adds onto matrix_bd before flash_attn. Chunk
     //     size = right+1, left_chunks = left/chunk_size; the mask is
@@ -176,8 +184,21 @@ struct BlockParams {
     enum class AttContextStyle { Regular, ChunkedLimited };
     AttContextStyle att_context_style = AttContextStyle::Regular;
 
+    // Bounded-window attention (offline, batch 1). When window_chunk > 0,
+    // attention reshapes the utterance into N = ceil(T / C) query blocks
+    // of C = window_chunk frames; block n attends to the W = window_keys
+    // keys starting at n*C - window_left. attn_chunked_mask is then
+    // [W, C, 1, N] (0 allowed / -INF) and carries the band itself, either
+    // the ChunkedLimited chunk topology or the Regular-local |q-k| window,
+    // plus the sequence edges; pos_emb has W + C - 1 rows with offset 0 at
+    // row window_left + C - 1. Same math as the dense [T,T] graph with
+    // work and scratch linear in T. 0 = dense reference graph.
+    int window_chunk = 0;
+    int window_left  = 0;
+    int window_keys  = 0;
+
     // Optional precomputed mask for ChunkedLimited. The caller builds
-    // this as a graph input shape [T_k, T_q, 1, 1] F16 (broadcasts
+    // this as a graph input shape [T_k, T_q, 1, 1] F32 (broadcasts
     // across heads) and uploads the host-computed pattern after the
     // compute buffer is allocated. Ignored for AttContextStyle::Regular.
     ggml_tensor * attn_chunked_mask = nullptr;
@@ -289,8 +310,10 @@ ggml_tensor * macaron_ff_residual(ggml_context * ctx,
 // matrix rotated so column k holds the score for relative offset k.
 ggml_tensor * rel_shift(ggml_context * ctx, ggml_tensor * x);
 
-// Crop the relative-position skew to its valid keys without copying scores.
-ggml_tensor * rel_shift_view(ggml_context * ctx, ggml_tensor * x, int64_t n_kv);
+// ggml_conv_2d with an F32 im2col. The vendored op rounds the activations to
+// F16 in im2col unless the kernel is BF16 (~5e-4 rel on parakeet pre_encode).
+ggml_tensor *
+conv_2d_f32(ggml_context * ctx, ggml_tensor * a, ggml_tensor * b, int s0, int s1, int p0, int p1, int d0, int d1);
 
 // f32-friendly Conv1D. Use instead of ggml_conv_1d for fp32 kernels on
 // Metal (see conv_2d_dw_f32 in conformer.cpp).
@@ -312,6 +335,21 @@ ggml_tensor * conv_2d_dw_f32(ggml_context * ctx,
                              int            p1,
                              int            d0,
                              int            d1);
+
+// Batch-stable depthwise Conv2D via ggml_conv_2d_dw_direct, with the
+// F32 kernel promotion the direct op needs. Prefer this over
+// conv_2d_dw_f32 / conv_1d_dw_f32 when single-shot and batched runs must
+// be bit-identical, or when the depthwise conv is hot: the im2col forms
+// inflate the activation by the kernel width. See conformer.cpp.
+ggml_tensor * conv_2d_dw_direct_f32(ggml_context * ctx,
+                                    ggml_tensor *  kernel,
+                                    ggml_tensor *  data,
+                                    int            s0,
+                                    int            s1,
+                                    int            p0,
+                                    int            p1,
+                                    int            d0,
+                                    int            d1);
 
 // f32-friendly 1D depthwise conv. Same Metal reasoning.
 ggml_tensor * conv_1d_dw_f32(ggml_context * ctx,
@@ -419,9 +457,14 @@ ggml_tensor * build_conformer_block(ggml_context *        ctx,
 // (one per ReLU stage), applies them, and writes the handles back for the
 // driver to fill. Offline (non-causal) pre_encode only.
 struct PreEncodeValidMasks {
-    ggml_tensor * mask_s1 = nullptr;  // after relu0
-    ggml_tensor * mask_s2 = nullptr;  // after relu3
-    ggml_tensor * mask_s3 = nullptr;  // after relu6
+    ggml_tensor * mask_s1        = nullptr;  // after relu0
+    ggml_tensor * mask_s2        = nullptr;  // after relu3 (after conv2 with pre_encode_mask_after_stride)
+    ggml_tensor * mask_s3        = nullptr;  // after relu6 (after conv5 with pre_encode_mask_after_stride)
+    // pre_encode_mask_after_stride only: zero positions past each utterance's
+    // single-run extent after relu3 / relu6, so a padded batch stays
+    // bit-identical to single runs (which never see the ReLU(bias) tail).
+    ggml_tensor * mask_s2_extent = nullptr;
+    ggml_tensor * mask_s3_extent = nullptr;
 };
 
 // DwStridingSubsampling pre_encode stack. Returns the final

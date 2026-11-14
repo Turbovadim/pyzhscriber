@@ -3,11 +3,10 @@ use crate::settings::{AppSettings, TranscriptionMode};
 use anyhow::{Context, Result, anyhow};
 use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 use std::sync::Arc;
-use transcribe_cpp::{
-    Backend, Model, ModelOptions, RunExtension, RunOptions, Task, WhisperRunOptions,
-};
+use transcribe_cpp::{Model, RunExtension, RunOptions, Task, WhisperRunOptions};
 
-const LANGUAGE_DETECTOR: &str = "handy-computer/whisper-tiny-gguf/whisper-tiny-Q8_0.gguf";
+pub(crate) const LANGUAGE_DETECTOR: &str =
+    "handy-computer/whisper-tiny-gguf/whisper-tiny-Q8_0.gguf";
 const LANGUAGE_DETECT_SAMPLES: usize = 5 * 16_000;
 
 struct LoadedEngine {
@@ -17,8 +16,12 @@ struct LoadedEngine {
 
 pub struct Transcriber {
     registry: Arc<ModelRegistry>,
+    inference: Mutex<()>,
     shutting_down: RwLock<bool>,
     loaded: Mutex<Option<LoadedEngine>>,
+    /// Whisper Tiny stays loaded beside the transcription model, so detecting
+    /// the language does not evict the model the recording is then routed to.
+    detector: Mutex<Option<Model>>,
     last_routed_language: Mutex<Option<String>>,
     last_single_language: Mutex<Option<String>>,
 }
@@ -31,37 +34,53 @@ impl Transcriber {
         }
         Self {
             registry,
+            inference: Mutex::new(()),
             shutting_down: RwLock::new(false),
             loaded: Mutex::new(None),
+            detector: Mutex::new(None),
             last_routed_language: Mutex::new(None),
             last_single_language: Mutex::new(None),
         }
     }
 
+    /// Loads what the next transcription needs: the language detector when
+    /// it will run, and the model it most likely routes to.
     pub fn preload_for(&self, settings: &AppSettings) -> Result<()> {
+        let _inference = self.inference.lock();
         let _operation = self.begin_operation()?;
-        let single_uses_external_detector = settings.transcription_mode
-            == TranscriptionMode::Single
-            && settings.allowed_languages.len() > 1
-            && !uses_native_language_constraint(
-                settings.transcription_mode,
-                &settings.allowed_languages,
-                self.registry.model_architecture(&settings.selected_model),
-            );
         let model_id = match settings.transcription_mode {
-            TranscriptionMode::Routed if settings.routes.len() > 1 => LANGUAGE_DETECTOR,
-            TranscriptionMode::Routed => settings
-                .routes
-                .first()
-                .map(|route| route.model.as_str())
-                .context("routing has no routes")?,
-            TranscriptionMode::Single if single_uses_external_detector => LANGUAGE_DETECTOR,
-            TranscriptionMode::Single => &settings.selected_model,
+            TranscriptionMode::Routed => {
+                let first = settings.routes.first().context("routing has no routes")?;
+                if settings.routes.len() > 1 {
+                    self.detector()?;
+                }
+                let last = self.last_routed_language.lock().clone();
+                settings
+                    .routes
+                    .iter()
+                    .find(|route| Some(&route.language) == last.as_ref())
+                    .unwrap_or(first)
+                    .model
+                    .clone()
+            }
+            TranscriptionMode::Single => {
+                let uses_external_detector = settings.allowed_languages.len() > 1
+                    && !uses_native_language_constraint(
+                        settings.transcription_mode,
+                        &settings.allowed_languages,
+                        self.registry.model_architecture(&settings.selected_model),
+                    );
+                if uses_external_detector {
+                    self.detector()?;
+                }
+                settings.selected_model.clone()
+            }
         };
-        self.ensure_loaded(model_id).map(|_| ())
+        self.ensure_loaded(&model_id).map(|_| ())
     }
 
     pub fn transcribe(&self, audio: &[f32], settings: &AppSettings) -> Result<String> {
+        let _inference = self.inference.lock();
         let _operation = self.begin_operation()?;
         let single_uses_native_constraint = uses_native_language_constraint(
             settings.transcription_mode,
@@ -80,7 +99,7 @@ impl Transcriber {
             TranscriptionMode::Routed => self.route(audio, settings)?,
         };
         let model = self.ensure_loaded(&model_id)?;
-        let caps = model.capabilities();
+        let caps = model.capabilities()?;
         let translate = settings.translate_to_english
             && caps.supports_translate
             && source_language.as_deref() != Some("en");
@@ -113,11 +132,7 @@ impl Transcriber {
             session.run(audio, &options)
         }
         .map_err(|error| anyhow!("transcription failed: {error}"))?;
-        let mut text = transcript.text.trim().to_string();
-        if settings.append_trailing_space && !text.is_empty() {
-            text.push(' ');
-        }
-        Ok(text)
+        Ok(transcript.text.trim().to_string())
     }
 
     /// Waits for model users to finish, then frees Metal resources before native
@@ -137,6 +152,7 @@ impl Transcriber {
 
     pub fn unload(&self) {
         *self.loaded.lock() = None;
+        *self.detector.lock() = None;
     }
 
     pub fn loaded_model_id(&self) -> Option<String> {
@@ -152,12 +168,12 @@ impl Transcriber {
             return Ok((first.model.clone(), Some(first.language.clone())));
         }
 
-        let detected = self.detect_language(audio)?;
         let languages = settings
             .routes
             .iter()
             .map(|route| route.language.clone())
             .collect::<Vec<_>>();
+        let detected = self.detect_language(audio, &languages)?;
         let language = choose_allowed_language(
             detected.as_deref(),
             self.last_routed_language.lock().as_deref(),
@@ -180,7 +196,7 @@ impl Transcriber {
         if allowed.len() == 1 {
             return allowed.first().cloned();
         }
-        let detected = self.detect_language(audio).ok().flatten();
+        let detected = self.detect_language(audio, allowed).ok().flatten();
         let language = choose_allowed_language(
             detected.as_deref(),
             self.last_single_language.lock().as_deref(),
@@ -190,16 +206,36 @@ impl Transcriber {
         Some(language)
     }
 
-    fn detect_language(&self, audio: &[f32]) -> Result<Option<String>> {
-        let model = self.ensure_loaded(LANGUAGE_DETECTOR)?;
+    /// Detection is restricted to `allowed`, so a near miss such as Ukrainian
+    /// for Russian resolves to the closest allowed language instead of being
+    /// discarded.
+    fn detect_language(&self, audio: &[f32], allowed: &[String]) -> Result<Option<String>> {
+        let model = self.detector()?;
         let count = audio.len().min(LANGUAGE_DETECT_SAMPLES);
+        let options = RunOptions {
+            family: Some(RunExtension::Whisper(WhisperRunOptions {
+                allowed_languages: Some(allowed.to_vec()),
+                ..WhisperRunOptions::default()
+            })),
+            ..RunOptions::default()
+        };
         let detected = {
             let mut session = model.session()?;
-            session.run(&audio[..count], &RunOptions::default())
+            session.run(&audio[..count], &options)
         }
         .ok()
         .and_then(|transcript| transcript.language);
         Ok(detected)
+    }
+
+    fn detector(&self) -> Result<Model> {
+        let mut detector = self.detector.lock();
+        if let Some(model) = detector.as_ref() {
+            return Ok(model.clone());
+        }
+        let model = load_model(&self.registry, LANGUAGE_DETECTOR)?;
+        *detector = Some(model.clone());
+        Ok(model)
     }
 
     fn ensure_loaded(&self, model_id: &str) -> Result<Model> {
@@ -207,28 +243,26 @@ impl Transcriber {
         if let Some(engine) = loaded.as_ref().filter(|engine| engine.model_id == model_id) {
             return Ok(engine.model.clone());
         }
-        let path = self.registry.resolve_path(model_id)?;
         loaded.take();
-        let model = Model::load_with(
-            &path,
-            &ModelOptions {
-                backend: Backend::Auto,
-                device: None,
-            },
-        )
-        .with_context(|| format!("load {}", path.display()))?;
-        log::info!(
-            "loaded {} with {} on {:?}",
-            model_id,
-            model.backend(),
-            model.device().ok().map(|device| device.description)
-        );
+        let model = load_model(&self.registry, model_id)?;
         *loaded = Some(LoadedEngine {
             model_id: model_id.to_string(),
             model: model.clone(),
         });
         Ok(model)
     }
+}
+
+fn load_model(registry: &ModelRegistry, model_id: &str) -> Result<Model> {
+    let path = registry.resolve_path(model_id)?;
+    let model = Model::load(&path).with_context(|| format!("load {}", path.display()))?;
+    log::info!(
+        "loaded {} with {} on {:?}",
+        model_id,
+        model.backend(),
+        model.device().ok().map(|device| device.description)
+    );
+    Ok(model)
 }
 
 fn choose_allowed_language(

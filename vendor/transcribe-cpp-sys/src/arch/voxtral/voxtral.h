@@ -13,6 +13,7 @@
 #include "ggml-backend.h"
 #include "ggml.h"
 #include "transcribe-backend.h"
+#include "transcribe-load-common.h"
 #include "transcribe-mel.h"
 #include "transcribe-model.h"
 #include "transcribe-session.h"
@@ -60,7 +61,7 @@ struct VoxtralModel final : public transcribe_model {
     ggml_context * ctx_meta = nullptr;
 
     transcribe::BackendPlan                    plan;
-    ggml_backend_buffer_t                      backend_buffer = nullptr;
+    transcribe::load_common::WeightStorage     weight_storage;
     transcribe::causal_lm::PackedGateUpHandles packed_gate_up;
 
     std::optional<transcribe::MelFrontend> mel;
@@ -74,9 +75,6 @@ struct VoxtralModel final : public transcribe_model {
 };
 
 struct VoxtralSession final : public transcribe_session {
-    ggml_context *       compute_ctx = nullptr;
-    ggml_backend_sched_t sched       = nullptr;
-
     transcribe::causal_lm::KvCache kv_cache;
 
     // Offline batched decode (transcribe_run_batch): a batched KV cache with

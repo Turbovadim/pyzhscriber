@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-labelledby="title">
+<title id="title">Pyzhscriber: Voice to type</title>
+<rect x="8" y="8" width="240" height="240" rx="54" fill="#000"/>
+<g stroke="#FFC34B" stroke-width="18" stroke-linecap="round">
+<path d="M56 118v20M88 92v72M120 104v48"/>
+</g>
+<path d="M158 66h42M179 66v124M158 190h42" fill="none" stroke="#FFF3D6" stroke-width="12" stroke-linecap="square"/>
+</svg>
+

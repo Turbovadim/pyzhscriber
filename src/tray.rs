@@ -34,6 +34,12 @@ impl AppTray {
             .with_icon(icon)
             .with_icon_as_template(false)
             .build()?;
+        #[cfg(target_os = "macos")]
+        if let Some(item) = tray.ns_status_item() {
+            // Preserve the item's position across launches, including when the
+            // menu bar is crowded enough to put new items in the overflow.
+            item.setAutosaveName(Some(&objc2_foundation::NSString::from_str("Pyzhscriber")));
+        }
         Ok(Self {
             _tray: tray,
             open_id: open.id().clone(),
@@ -64,18 +70,23 @@ impl AppTray {
                     } else {
                         tray = None;
                     }
-                    // Keep the Dock available if creating the menu bar icon failed.
-                    crate::app::set_dock_visible(!settings.hide_from_dock || tray.is_none());
                     previous_preferences = Some(preferences);
                 }
+                // A hidden Dock icon comes back while the window is open, and stays
+                // if creating the menu bar icon failed.
+                let window_open = cx.update(|cx| {
+                    main_window
+                        .update(cx, |_, window, _| crate::app::is_main_window_open(window))
+                        .unwrap_or(false)
+                });
+                crate::app::set_dock_visible(
+                    !settings.hide_from_dock || tray.is_none() || window_open,
+                );
                 while let Ok(event) = MenuEvent::receiver().try_recv() {
                     let Some(tray) = tray.as_ref() else { continue };
                     if event.id == tray.open_id {
                         cx.update(|cx| {
-                            // Accessory apps stay in the background, so bring the
-                            // whole app forward before focusing its window.
-                            cx.activate(true);
-                            let _ = main_window.update(cx, |_, window, _| window.activate_window());
+                            crate::app::show_main_window(main_window, cx);
                         });
                     } else if event.id == tray.toggle_id {
                         controller.toggle_recording();

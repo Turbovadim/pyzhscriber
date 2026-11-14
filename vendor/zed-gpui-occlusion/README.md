@@ -2,7 +2,7 @@
 
 This is a self-contained Cargo workspace containing patched `gpui_apple` and
 `gpui_macos` crates from Zed commit
-`fecc3273ed32643c2ea1b04a74c8780e2c9ffaf8`. It requires Rust 1.97.1.
+`b5cd310b3b54dfc659fcc06453e6358843dfe216`. It requires Rust 1.98.1.
 
 After a macOS window remains fully occluded for two seconds, the patch replaces
 its hidden `CAMetalLayer` with a plain `CALayer`. It then releases the drawable
@@ -34,6 +34,14 @@ revision recorded above.
 
 For a vendored copy, replace the two Git entries with paths to
 `crates/gpui_apple` and `crates/gpui_macos`, as this application does.
+
+## Shader header
+
+Upstream `gpui_apple` runs cbindgen over sibling `crates/gpui` sources to
+produce `scene.h`. This workspace has no `gpui` sources, so the header is
+committed as `crates/gpui_apple/src/scene.h` and `build.rs` uses it directly.
+When moving to a new Zed revision, regenerate it from a Zed checkout at that
+revision with upstream's `build.rs`, and copy `OUT_DIR/scene.h` here.
 
 ## Verify the standalone workspace
 

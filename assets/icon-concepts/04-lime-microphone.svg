@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-labelledby="title">
+<title id="title">Pyzhscriber: Lime microphone</title>
+<rect x="8" y="8" width="240" height="240" rx="54" fill="#000"/>
+<rect x="102" y="44" width="52" height="108" rx="26" fill="#C2F64B"/>
+<path d="M78 124v8a50 50 0 0 0 100 0v-8M128 182v26M103 208h50" fill="none" stroke="#C2F64B" stroke-width="14" stroke-linecap="round"/>
+<path d="M118 71h20M118 92h20M118 113h20" stroke="#000" stroke-width="7" stroke-linecap="round"/>
+</svg>
+

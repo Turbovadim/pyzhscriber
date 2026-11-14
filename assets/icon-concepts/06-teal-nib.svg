@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-labelledby="title">
+<title id="title">Pyzhscriber: Teal nib</title>
+<rect x="8" y="8" width="240" height="240" rx="54" fill="#000"/>
+<path d="m48 208 30-102L192 48l16 16-58 114L48 208Z" fill="#36DEC4"/>
+<path d="m48 208 80-80" stroke="#000" stroke-width="12"/>
+<circle cx="134" cy="122" r="16" fill="#000"/>
+<path d="m166 62 28 28 14-26-16-16-26 14Z" fill="#A6FFEA"/>
+</svg>
+

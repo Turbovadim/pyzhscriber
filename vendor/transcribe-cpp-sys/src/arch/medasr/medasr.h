@@ -6,6 +6,7 @@
 #pragma once
 
 #include "transcribe-backend.h"
+#include "transcribe-load-common.h"
 #include "transcribe-mel.h"
 #include "transcribe-model.h"
 #include "transcribe-session.h"
@@ -35,8 +36,8 @@ struct MedAsrModel final : public transcribe_model {
     MedAsrWeights  weights;
     ggml_context * ctx_meta = nullptr;
 
-    transcribe::BackendPlan plan;
-    ggml_backend_buffer_t   backend_buffer = nullptr;
+    transcribe::BackendPlan                plan;
+    transcribe::load_common::WeightStorage weight_storage;
 
     std::optional<transcribe::MelFrontend> mel;
 
@@ -47,9 +48,6 @@ struct MedAsrModel final : public transcribe_model {
 };
 
 struct MedAsrSession final : public transcribe_session {
-    ggml_context *       compute_ctx = nullptr;
-    ggml_backend_sched_t sched       = nullptr;
-
     ggml_tensor * encoder_out = nullptr;
 
     std::vector<float> mel_buf;
@@ -58,6 +56,7 @@ struct MedAsrSession final : public transcribe_session {
 
     MedAsrSession() = default;
     ~MedAsrSession() override;
+    void on_scratch_released() noexcept override;
 };
 
 }  // namespace transcribe::medasr

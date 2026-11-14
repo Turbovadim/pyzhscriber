@@ -19,6 +19,7 @@
 #include "gguf.h"
 #include "medasr.h"
 #include "transcribe-arch.h"
+#include "transcribe-backend.h"
 #include "transcribe-batch-util.h"
 #include "transcribe-debug.h"
 #include "transcribe-env.h"
@@ -48,15 +49,10 @@ extern const Arch arch;
 static_assert(std::is_base_of_v<transcribe_model, MedAsrModel>);
 static_assert(std::is_base_of_v<transcribe_session, MedAsrSession>);
 
-MedAsrSession::~MedAsrSession() {
-    if (sched != nullptr) {
-        safe_sched_free(sched);
-        sched = nullptr;
-    }
-    if (compute_ctx != nullptr) {
-        ggml_free(compute_ctx);
-        compute_ctx = nullptr;
-    }
+MedAsrSession::~MedAsrSession() = default;
+
+// Base release_scratch has freed sched/compute_ctx; drop what pointed into them.
+void MedAsrSession::on_scratch_released() noexcept {
     encoder_out = nullptr;
 }
 
@@ -65,10 +61,7 @@ MedAsrModel::~MedAsrModel() {
         ggml_free(ctx_meta);
         ctx_meta = nullptr;
     }
-    if (backend_buffer != nullptr) {
-        safe_buffer_free(backend_buffer);
-        backend_buffer = nullptr;
-    }
+    weight_storage.reset();
     for (auto it = plan.scheduler_list.rbegin(); it != plan.scheduler_list.rend(); ++it) {
         safe_backend_free(*it);
     }
@@ -192,16 +185,8 @@ transcribe_status load(Loader & loader, const transcribe_model_load_params * par
     m->backend         = ggml_backend_name(m->plan.primary);
     m->primary_backend = m->plan.primary;
 
-    ggml_backend_buffer_t weights_buffer = ggml_backend_alloc_ctx_tensors(m->ctx_meta, m->plan.primary);
-    if (weights_buffer == nullptr) {
-        gguf_free(gguf_data);
-        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "medasr: ggml_backend_alloc_ctx_tensors failed");
-        return TRANSCRIBE_ERR_GGUF;
-    }
-    m->backend_buffer = weights_buffer;
-    ggml_backend_buffer_set_usage(weights_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-
-    if (auto st = transcribe::load_common::stream_tensor_data(loader.path(), gguf_data, m->ctx_meta, "medasr");
+    if (const transcribe_status st = transcribe::load_common::load_weights(
+            loader.path(), gguf_data, m->ctx_meta, m->plan, params, "medasr", m->weight_storage);
         st != TRANSCRIBE_OK) {
         gguf_free(gguf_data);
         return st;
@@ -484,15 +469,12 @@ transcribe_status run(transcribe_session * session, const float * pcm, int n_sam
                                            static_cast<int>(gm->plan.scheduler_list.size()),
                                            /*graph_size=*/8192, /*parallel=*/false, /*op_offload=*/true);
         if (gc->sched == nullptr) {
-            transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
-                                "medasr run: scheduler allocation failed — out of memory. "
-                                "Split long audio into shorter segments (see "
-                                "transcribe_capabilities.max_audio_ms).");
-            return TRANSCRIBE_ERR_OOM;
+            transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "medasr run: ggml_backend_sched_new failed");
+            return TRANSCRIBE_ERR_BACKEND;
         }
     }
     ggml_backend_sched_reset(gc->sched);
-    if (!ggml_backend_sched_alloc_graph(gc->sched, eb.graph)) {
+    if (!TRANSCRIBE_ALLOC_SCHED_GRAPH(gc->sched, eb.graph, "medasr")) {
         transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
                             "medasr run: encoder graph allocation failed — out of memory. "
                             "Split long audio into shorter segments (see "
@@ -532,7 +514,7 @@ transcribe_status run(transcribe_session * session, const float * pcm, int n_sam
     const int64_t t_enc_start = ggml_time_us();
     if (ggml_backend_sched_graph_compute(gc->sched, eb.graph) != GGML_STATUS_SUCCESS) {
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "medasr: graph_compute failed");
-        return TRANSCRIBE_ERR_GGUF;
+        return TRANSCRIBE_ERR_BACKEND;
     }
     gc->t_encode_us = ggml_time_us() - t_enc_start;
 
@@ -757,15 +739,12 @@ transcribe_status run_batch_encode(MedAsrSession *                         gc,
                                            static_cast<int>(gm->plan.scheduler_list.size()),
                                            /*graph_size=*/8192, /*parallel=*/false, /*op_offload=*/true);
         if (gc->sched == nullptr) {
-            transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
-                                "medasr run: scheduler allocation failed — out of memory. "
-                                "Split long audio into shorter segments (see "
-                                "transcribe_capabilities.max_audio_ms).");
-            return TRANSCRIBE_ERR_OOM;
+            transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "medasr run: ggml_backend_sched_new failed");
+            return TRANSCRIBE_ERR_BACKEND;
         }
     }
     ggml_backend_sched_reset(gc->sched);
-    if (!ggml_backend_sched_alloc_graph(gc->sched, eb.graph)) {
+    if (!TRANSCRIBE_ALLOC_SCHED_GRAPH(gc->sched, eb.graph, "medasr")) {
         transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
                             "medasr run: encoder graph allocation failed — out of memory. "
                             "Split long audio into shorter segments (see "
@@ -851,7 +830,7 @@ transcribe_status run_batch_encode(MedAsrSession *                         gc,
     const int64_t t_enc_start = ggml_time_us();
     if (ggml_backend_sched_graph_compute(gc->sched, eb.graph) != GGML_STATUS_SUCCESS) {
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "medasr run_batch: graph_compute failed");
-        return TRANSCRIBE_ERR_GGUF;
+        return TRANSCRIBE_ERR_BACKEND;
     }
     gc->t_encode_us = ggml_time_us() - t_enc_start;
 

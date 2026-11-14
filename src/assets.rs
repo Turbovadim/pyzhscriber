@@ -2,6 +2,12 @@ use gpui::{AssetSource, Result, SharedString};
 use std::borrow::Cow;
 
 const ASSETS: &[(&str, &[u8])] = &[
+    ("icons/mic.svg", include_bytes!("../assets/icons/mic.svg")),
+    ("icons/type.svg", include_bytes!("../assets/icons/type.svg")),
+    (
+        "icons/circle-alert.svg",
+        include_bytes!("../assets/icons/circle-alert.svg"),
+    ),
     (
         "icons/chevron-down.svg",
         include_bytes!("../assets/icons/chevron-down.svg"),

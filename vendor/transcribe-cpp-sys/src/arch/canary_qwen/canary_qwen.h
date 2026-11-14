@@ -19,6 +19,7 @@
 
 #include "causal_lm/causal_lm.h"
 #include "transcribe-backend.h"
+#include "transcribe-load-common.h"
 #include "transcribe-mel.h"
 #include "transcribe-model.h"
 #include "transcribe-session.h"
@@ -57,8 +58,8 @@ struct CanaryQwenModel final : public transcribe_model {
     CanaryQwenWeights weights;
     ggml_context *    ctx_meta = nullptr;
 
-    transcribe::BackendPlan plan;
-    ggml_backend_buffer_t   backend_buffer = nullptr;
+    transcribe::BackendPlan                plan;
+    transcribe::load_common::WeightStorage weight_storage;
 
     // BatchNorm fusion in the conformer conv module: fused (scale, bias)
     // computed at load time; running_mean/var unused at inference.
@@ -95,9 +96,6 @@ struct CanaryQwenModel final : public transcribe_model {
 };
 
 struct CanaryQwenSession final : public transcribe_session {
-    ggml_context *       compute_ctx = nullptr;
-    ggml_backend_sched_t sched       = nullptr;
-
     transcribe::causal_lm::KvCache kv_cache;
 
     // Batched KV cache for offline transcribe_run_batch (n_batch slabs).

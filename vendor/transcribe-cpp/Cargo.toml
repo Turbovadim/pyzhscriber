@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.74"
 name = "transcribe-cpp"
-version = "0.2.2"
+version = "0.4.1"
 build = "build.rs"
 links = "transcribe_cpp"
 autolib = false
@@ -48,6 +48,7 @@ dynamic-backends = [
 metal = ["transcribe-cpp-sys/metal"]
 openmp = ["transcribe-cpp-sys/openmp"]
 rocm = ["transcribe-cpp-sys/rocm"]
+serde = ["dep:serde"]
 shared = ["transcribe-cpp-sys/shared"]
 vulkan = ["transcribe-cpp-sys/vulkan"]
 
@@ -76,6 +77,10 @@ name = "transcribe-file"
 path = "examples/transcribe-file.rs"
 
 [[test]]
+name = "backend_mask"
+path = "tests/backend_mask.rs"
+
+[[test]]
 name = "cancel"
 path = "tests/cancel.rs"
 
@@ -88,6 +93,10 @@ name = "device_select"
 path = "tests/device_select.rs"
 
 [[test]]
+name = "diarize"
+path = "tests/diarize.rs"
+
+[[test]]
 name = "extensions"
 path = "tests/extensions.rs"
 
@@ -96,8 +105,20 @@ name = "family"
 path = "tests/family.rs"
 
 [[test]]
+name = "langid"
+path = "tests/langid.rs"
+
+[[test]]
 name = "no_model"
 path = "tests/no_model.rs"
+
+[[test]]
+name = "prompting"
+path = "tests/prompting.rs"
+
+[[test]]
+name = "serde"
+path = "tests/serde.rs"
 
 [[test]]
 name = "streaming"
@@ -107,16 +128,33 @@ path = "tests/streaming.rs"
 name = "transcribe"
 path = "tests/transcribe.rs"
 
+[[test]]
+name = "vad"
+path = "tests/vad.rs"
+
 [dependencies.log]
 version = "0.4"
+
+[dependencies.serde]
+version = "1"
+features = ["derive"]
+optional = true
 
 [dependencies.thiserror]
 version = "2"
 
 [dependencies.transcribe-cpp-sys]
-version = "0.2.2"
+version = "0.4.1"
 path = "../transcribe-cpp-sys"
 default-features = false
 
 [dev-dependencies.hound]
 version = "3"
+
+[dev-dependencies.postcard]
+version = "1"
+features = ["alloc"]
+default-features = false
+
+[dev-dependencies.serde_json]
+version = "1"

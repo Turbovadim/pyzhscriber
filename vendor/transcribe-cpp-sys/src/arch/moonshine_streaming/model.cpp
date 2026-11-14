@@ -28,6 +28,7 @@
 #include "gguf.h"
 #include "moonshine_streaming.h"
 #include "transcribe-arch.h"
+#include "transcribe-backend.h"
 #include "transcribe-batch-util.h"
 #include "transcribe-debug.h"
 #include "transcribe-env.h"
@@ -36,6 +37,7 @@
 #include "transcribe-loader.h"
 #include "transcribe-log.h"
 #include "transcribe-meta.h"
+#include "transcribe-repetition-guard.h"
 #include "transcribe/moonshine_streaming.h"
 #include "weights.h"
 
@@ -43,6 +45,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -60,14 +63,6 @@ static_assert(std::is_base_of_v<transcribe_session, MoonshineStreamingSession>);
 
 MoonshineStreamingSession::~MoonshineStreamingSession() {
     kv_cache.free();
-    if (sched != nullptr) {
-        safe_sched_free(sched);
-        sched = nullptr;
-    }
-    if (compute_ctx != nullptr) {
-        ggml_free(compute_ctx);
-        compute_ctx = nullptr;
-    }
 }
 
 MoonshineStreamingModel::~MoonshineStreamingModel() {
@@ -75,10 +70,7 @@ MoonshineStreamingModel::~MoonshineStreamingModel() {
         ggml_free(ctx_meta);
         ctx_meta = nullptr;
     }
-    if (backend_buffer != nullptr) {
-        safe_buffer_free(backend_buffer);
-        backend_buffer = nullptr;
-    }
+    weight_storage.reset();
     for (auto it = plan.scheduler_list.rbegin(); it != plan.scheduler_list.rend(); ++it) {
         safe_backend_free(*it);
     }
@@ -87,22 +79,39 @@ MoonshineStreamingModel::~MoonshineStreamingModel() {
     plan.primary_kind = transcribe::BackendKind::Unknown;
 }
 
-// Input-length contract (see docs/input-limits.md): like moonshine, the wall
-// is on *output*, not input. The encoder takes any PCM length; the decode loop
-// stops at the decoder position cap (dec_max_position_embeddings, e.g. 4096)
-// before EOS, silently truncating. On a cap-exit we set
-// transcribe_was_truncated() and WARN (same as qwen3_asr).
+// Input-length contract (see docs/input-limits.md). Two walls:
+//
+//   - Input: the adapter adds pos_emb[frame] to every encoder frame, from a
+//     table of dec_max_position_embeddings rows (weights.cpp pins the
+//     adapter.pos_emb.weight shape to it; 4096 for every published size).
+//     That is 4096 encoder frames = 81.92 s of audio per decode, and the
+//     reference raises IndexError past it. A frame index beyond the table
+//     used to reach ggml_get_rows out of bounds: GGML_ASSERT abort on CPU,
+//     garbage reads on Metal. One-shot / batch input past it is rejected with
+//     TRANSCRIBE_ERR_INPUT_TOO_LONG; a stream stops consuming audio at the
+//     cap and reports transcribe_was_truncated() (the voxtral_realtime
+//     contract for an absolute position cap).
+//   - Output: the decode loop stops at the decoder position cap (also
+//     dec_max_position_embeddings tokens) or the duration budget before EOS;
+//     that sets transcribe_was_truncated() and WARNs.
+int adapter_max_frames(const MoonshineStreamingHParams & hp) {
+    return hp.dec_max_position_embeddings;
+}
 
-// Advisory transcribe_capabilities::max_audio_ms: the audio the output budget
-// (dec_max_position_embeddings tokens) covers at ~4 output tokens/sec. 0 means
-// unknown/unbounded. Advisory only — does not reject.
+// transcribe_capabilities::max_audio_ms: the input wall above, in ms of
+// 16 kHz audio (two stride-2 convs over frame_len-sample frames, so one
+// encoder frame is 4 * frame_len samples). Also capped by the advisory audio
+// the output budget covers at ~4 tokens/sec, which is far larger. 0 means
+// unknown.
 constexpr int k_tokens_per_sec = 4;  // rough speech-rate estimate; advisory only
 
 int64_t moonshine_streaming_max_audio_ms(const MoonshineStreamingHParams & hp) {
-    if (hp.dec_max_position_embeddings <= 0) {
+    if (hp.dec_max_position_embeddings <= 0 || hp.enc_frame_len <= 0) {
         return 0;
     }
-    return static_cast<int64_t>(hp.dec_max_position_embeddings) * 1000 / k_tokens_per_sec;
+    const int64_t output_ms = static_cast<int64_t>(hp.dec_max_position_embeddings) * 1000 / k_tokens_per_sec;
+    const int64_t input_ms  = static_cast<int64_t>(adapter_max_frames(hp)) * 4 * hp.enc_frame_len * 1000 / 16000;
+    return std::min(output_ms, input_ms);
 }
 
 bool kv_cache_init(MoonshineStreamingKvCache & cache,
@@ -275,17 +284,8 @@ transcribe_status load(Loader & loader, const transcribe_model_load_params * par
     m->backend         = ggml_backend_name(m->plan.primary);
     m->primary_backend = m->plan.primary;
 
-    ggml_backend_buffer_t weights_buffer = ggml_backend_alloc_ctx_tensors(m->ctx_meta, m->plan.primary);
-    if (weights_buffer == nullptr) {
-        gguf_free(gguf_data);
-        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "moonshine_streaming: ggml_backend_alloc_ctx_tensors failed");
-        return TRANSCRIBE_ERR_GGUF;
-    }
-    m->backend_buffer = weights_buffer;
-    ggml_backend_buffer_set_usage(weights_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-
-    if (auto st =
-            transcribe::load_common::stream_tensor_data(loader.path(), gguf_data, m->ctx_meta, "moonshine_streaming");
+    if (const transcribe_status st = transcribe::load_common::load_weights(
+            loader.path(), gguf_data, m->ctx_meta, m->plan, params, "moonshine_streaming", m->weight_storage);
         st != TRANSCRIBE_OK) {
         gguf_free(gguf_data);
         return st;
@@ -372,7 +372,7 @@ transcribe_status ensure_sched(MoonshineStreamingSession * cc, MoonshineStreamin
                                        static_cast<int>(cm->plan.scheduler_list.size()), 16384, false, true);
     if (cc->sched == nullptr) {
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "moonshine_streaming: ggml_backend_sched_new failed");
-        return TRANSCRIBE_ERR_GGUF;
+        return TRANSCRIBE_ERR_BACKEND;
     }
     return TRANSCRIBE_OK;
 }
@@ -489,7 +489,7 @@ transcribe_status encode_window_to_host(MoonshineStreamingSession * cc,
         return st;
     }
     ggml_backend_sched_reset(cc->sched);
-    if (!ggml_backend_sched_alloc_graph(cc->sched, eb.graph)) {
+    if (!TRANSCRIBE_ALLOC_SCHED_GRAPH(cc->sched, eb.graph, "moonshine_streaming")) {
         transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
                             "moonshine_streaming encode_window: encoder graph allocation "
                             "failed — out of memory.");
@@ -511,7 +511,7 @@ transcribe_status encode_window_to_host(MoonshineStreamingSession * cc,
 
     if (ggml_backend_sched_graph_compute(cc->sched, eb.graph) != GGML_STATUS_SUCCESS) {
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "moonshine_streaming encode_window: encoder compute failed");
-        return TRANSCRIBE_ERR_GGUF;
+        return TRANSCRIBE_ERR_BACKEND;
     }
 
     if (emit_dumps) {
@@ -547,6 +547,126 @@ transcribe_status encode_window_to_host(MoonshineStreamingSession * cc,
     return TRANSCRIBE_OK;
 }
 
+// Encoder frames a windowed encode emits per window (see encode_pcm_to_host).
+// 1024 frames is ~20 s of audio at 50 frames/s. With medium's 210 + 4 frames
+// of left context and 12 of right, a window is ~1250 frames: the per-layer
+// masks and attention scores are ~6 MB each instead of growing with T^2, and
+// the context overhead is ~20%.
+constexpr int k_encode_window_emit_frames = 1024;
+
+// TRANSCRIBE_MOONSHINE_STREAMING_ENC_WINDOW=<frames> overrides the emit size,
+// so the windowed path can be exercised (and checked against the single-pass
+// encoder) on short clips. Values below 1 are ignored.
+int encode_window_emit_frames() {
+    if (const char * v = transcribe::env::str("TRANSCRIBE_MOONSHINE_STREAMING_ENC_WINDOW"); v != nullptr) {
+        char *     end = nullptr;
+        const long n   = std::strtol(v, &end, 10);
+        if (end != v && n >= 1 && n <= (1 << 20)) {
+            return static_cast<int>(n);
+        }
+    }
+    return k_encode_window_emit_frames;
+}
+
+// Encode a whole utterance in bounded windows and stitch the result.
+//
+// The one-shot encoder used to run the whole utterance as one graph, which
+// materialises one dense [T_enc, T_enc] mask per layer (host and device) plus
+// [T_enc, T_enc, n_heads] attention scores: T^2 growth, 12-26 GB of footprint
+// for 5 minutes of audio, and an abort at 10.
+//
+// Windowing is exact for this architecture, not an approximation. Every
+// encoder layer attends through a finite sliding window (L_i, R_i) and the
+// frontend convs are causal with a bounded receptive field, so the encoder
+// output at frame t depends only on conv-stack frames
+// [t - L_total, t + R_total] (cumulative_*_context), which in turn depend only
+// on PCM from k_frontend_pad_enc_frames further left. A window that carries
+// that much context on each side reproduces the single-pass output for its
+// emitted frames; the streaming path (flush_stable_frames) relies on the same
+// algebra and is parity-tested against one-shot. Window cuts land on
+// encoder-frame boundaries (samples_per_encoder_frame PCM samples), which keeps
+// both strided convs phase-aligned with the single pass.
+//
+// "Reproduces" is mathematical, not bitwise: backend kernels (Metal flash
+// attention, softmax, matmul tiling) group their reductions by a frame's
+// position within the graph, so a window that does not start at frame 0 sums
+// in a different order. Measured on tiny: <= ~5e-4 of the activation range,
+// uniform across the window with no rise near the cuts (a missing-context bug
+// shows up as a spike at each cut), and about half of what toggling flash
+// attention already does to the single pass.
+//
+// Short inputs (one window's worth) take the single-pass path unchanged.
+// `pcm` must already be right-padded to a multiple of frame_len.
+transcribe_status encode_pcm_to_host(MoonshineStreamingSession * cc,
+                                     MoonshineStreamingModel *   cm,
+                                     const float *               pcm,
+                                     int                         n_samples,
+                                     bool                        emit_dumps,
+                                     std::vector<float> &        out_enc_host,
+                                     int &                       out_T_enc) {
+    const auto & hp      = cm->hparams;
+    const int    T_total = encoder_t_enc(hp, n_samples);
+    const int    emit    = encode_window_emit_frames();
+    const int    L       = cumulative_left_context(hp) + k_frontend_pad_enc_frames;
+    const int    R       = cumulative_right_context(hp);
+    const int    spf     = samples_per_encoder_frame(hp);
+
+    if (T_total <= 0 || T_total <= emit + L + R || spf <= 0) {
+        return encode_window_to_host(cc, cm, pcm, n_samples, emit_dumps, out_enc_host, out_T_enc);
+    }
+
+    const int    enc_h = hp.enc_d_model;
+    const size_t total = static_cast<size_t>(enc_h) * static_cast<size_t>(T_total);
+    out_enc_host.assign(total, 0.0f);
+
+    // Dump points describe a single encoder graph; a windowed encode has one
+    // per window, so it emits none rather than a misleading last window.
+    if (emit_dumps) {
+        log_msg(TRANSCRIBE_LOG_LEVEL_DEBUG,
+                "moonshine_streaming: windowed encode (%d frames in windows of %d), encoder dumps skipped", T_total,
+                emit);
+    }
+
+    std::vector<float> win_host;
+    for (int emit_start = 0; emit_start < T_total; emit_start += emit) {
+        if (cc->poll_abort()) {
+            return TRANSCRIBE_ERR_ABORTED;
+        }
+        const int emit_end  = std::min(T_total, emit_start + emit);
+        const int win_start = std::max(0, emit_start - L);
+        const int win_end   = std::min(T_total, emit_end + R);
+
+        // The last window ends at the padded end of the input, exactly as the
+        // single pass does; every other one ends on a frame boundary.
+        const int64_t pcm_start = static_cast<int64_t>(win_start) * spf;
+        const int64_t pcm_end   = (win_end == T_total) ? n_samples : static_cast<int64_t>(win_end) * spf;
+        if (pcm_end <= pcm_start || pcm_end > n_samples) {
+            return TRANSCRIBE_ERR_INVALID_ARG;
+        }
+
+        int win_T = 0;
+        if (auto st = encode_window_to_host(cc, cm, pcm + pcm_start, static_cast<int>(pcm_end - pcm_start),
+                                            /*emit_dumps=*/false, win_host, win_T);
+            st != TRANSCRIBE_OK) {
+            return st;
+        }
+        if (win_T != win_end - win_start) {
+            log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
+                    "moonshine_streaming: encoder window [%d, %d) produced %d frames, expected %d", win_start, win_end,
+                    win_T, win_end - win_start);
+            return TRANSCRIBE_ERR_GGUF;
+        }
+
+        const size_t src_off = static_cast<size_t>(enc_h) * static_cast<size_t>(emit_start - win_start);
+        const size_t dst_off = static_cast<size_t>(enc_h) * static_cast<size_t>(emit_start);
+        const size_t n_float = static_cast<size_t>(enc_h) * static_cast<size_t>(emit_end - emit_start);
+        std::memcpy(out_enc_host.data() + dst_off, win_host.data() + src_off, n_float * sizeof(float));
+    }
+
+    out_T_enc = T_total;
+    return TRANSCRIBE_OK;
+}
+
 // Apply the adapter (pos_emb get_rows + add, plus optional proj) to an
 // encoder slice. The pos_ids supplied to the graph are absolute frame
 // positions starting at `abs_frame_offset`, so the slice can sit
@@ -573,6 +693,15 @@ transcribe_status apply_adapter_window(MoonshineStreamingSession * cc,
     const int    enc_h = hp.enc_d_model;
     const int    dec_h = hp.dec_d_model;
 
+    // Every caller bounds its frames to the table first; this is the backstop
+    // that keeps ggml_get_rows in range no matter what (see adapter_max_frames).
+    if (static_cast<int64_t>(abs_frame_offset) + n_frames > adapter_max_frames(hp)) {
+        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
+                "moonshine_streaming adapter: frames [%d, %d) exceed the %d-entry position table", abs_frame_offset,
+                abs_frame_offset + n_frames, adapter_max_frames(hp));
+        return TRANSCRIBE_ERR_INPUT_TOO_LONG;
+    }
+
     const int64_t t_start = ggml_time_us();
 
     if (auto st = ensure_sched(cc, cm); st != TRANSCRIBE_OK) {
@@ -590,7 +719,7 @@ transcribe_status apply_adapter_window(MoonshineStreamingSession * cc,
         return TRANSCRIBE_ERR_GGUF;
     }
     ggml_backend_sched_reset(cc->sched);
-    if (!ggml_backend_sched_alloc_graph(cc->sched, ab.graph)) {
+    if (!TRANSCRIBE_ALLOC_SCHED_GRAPH(cc->sched, ab.graph, "moonshine_streaming")) {
         transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
                             "moonshine_streaming adapter: graph allocation failed — "
                             "out of memory.");
@@ -606,7 +735,7 @@ transcribe_status apply_adapter_window(MoonshineStreamingSession * cc,
 
     if (ggml_backend_sched_graph_compute(cc->sched, ab.graph) != GGML_STATUS_SUCCESS) {
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "moonshine_streaming adapter: compute failed");
-        return TRANSCRIBE_ERR_GGUF;
+        return TRANSCRIBE_ERR_BACKEND;
     }
 
     if (emit_dumps) {
@@ -677,7 +806,7 @@ transcribe_status project_cross_kv_window(MoonshineStreamingSession *       cc,
     }
 
     ggml_backend_sched_reset(cc->sched);
-    if (!ggml_backend_sched_alloc_graph(cc->sched, pb.graph)) {
+    if (!TRANSCRIBE_ALLOC_SCHED_GRAPH(cc->sched, pb.graph, "moonshine_streaming")) {
         transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
                             "moonshine_streaming cross_kv_proj: graph allocation failed — "
                             "out of memory.");
@@ -689,7 +818,7 @@ transcribe_status project_cross_kv_window(MoonshineStreamingSession *       cc,
 
     if (ggml_backend_sched_graph_compute(cc->sched, pb.graph) != GGML_STATUS_SUCCESS) {
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "moonshine_streaming cross_kv_proj: compute failed");
-        return TRANSCRIBE_ERR_GGUF;
+        return TRANSCRIBE_ERR_BACKEND;
     }
 
     const size_t       per_slice_floats = static_cast<size_t>(dec_h) * static_cast<size_t>(n_frames);
@@ -801,7 +930,7 @@ transcribe_status commit_cross_kv_from_host(MoonshineStreamingSession *         
     }
 
     ggml_backend_sched_reset(cc->sched);
-    if (!ggml_backend_sched_alloc_graph(cc->sched, cb.graph)) {
+    if (!TRANSCRIBE_ALLOC_SCHED_GRAPH(cc->sched, cb.graph, "moonshine_streaming")) {
         transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
                             "moonshine_streaming cross_kv_commit: graph allocation failed — "
                             "out of memory.");
@@ -815,7 +944,7 @@ transcribe_status commit_cross_kv_from_host(MoonshineStreamingSession *         
 
     if (ggml_backend_sched_graph_compute(cc->sched, cb.graph) != GGML_STATUS_SUCCESS) {
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "moonshine_streaming cross_kv_commit: compute failed");
-        return TRANSCRIBE_ERR_GGUF;
+        return TRANSCRIBE_ERR_BACKEND;
     }
     cc->kv_cache.cross_populated = true;
 
@@ -831,7 +960,8 @@ transcribe_status decode_from_kv_cache(MoonshineStreamingSession *   cc,
                                        MoonshineStreamingModel *     cm,
                                        int                           T_enc,
                                        const transcribe_run_params * params,
-                                       bool                          emit_dumps) {
+                                       bool                          emit_dumps,
+                                       bool                          interim) {
     (void) params;
 
     if (cc->poll_abort()) {
@@ -850,6 +980,15 @@ transcribe_status decode_from_kv_cache(MoonshineStreamingSession *   cc,
 
     const auto &  hp             = cm->hparams;
     const int64_t t_decode_start = ggml_time_us();
+
+    // The truncation flags describe the transcript this decode produces: a
+    // stream re-decodes from BOS on each feed, and after finalize the flags
+    // must reflect the final transcript, not an earlier partial. An interim
+    // (per-feed) decode logs its stop at DEBUG; stream_finalize warns once
+    // for the transcript it keeps.
+    cc->was_truncated                         = false;
+    cc->stopped_on_repetition                 = false;
+    const transcribe_log_level stop_log_level = interim ? TRANSCRIBE_LOG_LEVEL_DEBUG : TRANSCRIBE_LOG_LEVEL_WARN;
 
     auto try_dump = [emit_dumps](const char * name, ggml_tensor * t, const char * stage) {
         if (!emit_dumps || t == nullptr) {
@@ -889,7 +1028,7 @@ transcribe_status decode_from_kv_cache(MoonshineStreamingSession *   cc,
             return TRANSCRIBE_ERR_GGUF;
         }
         ggml_backend_sched_reset(cc->sched);
-        if (!ggml_backend_sched_alloc_graph(cc->sched, db.graph)) {
+        if (!TRANSCRIBE_ALLOC_SCHED_GRAPH(cc->sched, db.graph, "moonshine_streaming")) {
             transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
                                 "moonshine_streaming decode: step graph allocation failed — "
                                 "out of memory.");
@@ -922,7 +1061,7 @@ transcribe_status decode_from_kv_cache(MoonshineStreamingSession *   cc,
         if (ggml_backend_sched_graph_compute(cc->sched, db.graph) != GGML_STATUS_SUCCESS) {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "moonshine_streaming decode: decoder compute failed (n_past=%d)",
                     n_past_in);
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_BACKEND;
         }
 
         if (dump_prompt) {
@@ -985,6 +1124,7 @@ transcribe_status decode_from_kv_cache(MoonshineStreamingSession *   cc,
     // dec.logits_raw.gen20 dumps the logits that predict the 20th
     // emitted token (n_past == 20 at that step). Matches moonshine.
     constexpr int k_mid_gen_step = 20;
+    bool          repeating      = false;
     while (next_token != eos && n_past < gen_cap) {
         if (cc->poll_abort()) {
             return TRANSCRIBE_ERR_ABORTED;
@@ -1002,20 +1142,26 @@ transcribe_status decode_from_kv_cache(MoonshineStreamingSession *   cc,
         }
         if (next_token != eos) {
             generated_ids.push_back(next_token);
+            if (transcribe::stop_on_repetition(generated_ids, "moonshine_streaming run", stop_log_level)) {
+                cc->mark_repetition_stop();
+                repeating = true;
+                break;
+            }
         }
     }
 
     // Non-EOS after the loop means gen_cap stopped decode before EOS. gen_cap
     // is either the position cap or the tighter duration budget.
-    if (next_token != eos) {
+    if (!repeating && next_token != eos) {
         cc->was_truncated              = true;
         const bool hit_duration_budget = (gen_cap < max_pos) || (max_pos <= 0);
-        transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_WARN,
+        transcribe::log_msg(stop_log_level,
                             "moonshine run: output truncated at %d tokens — decode reached the "
                             "%s (%d) before end-of-stream; the transcript may be incomplete. "
                             "See transcribe_capabilities.max_audio_ms.",
                             static_cast<int>(generated_ids.size()),
                             hit_duration_budget ? "generation budget" : "position cap", gen_cap);
+        transcribe::trim_repetition_at_budget_stop(generated_ids, "moonshine_streaming run", stop_log_level);
     }
 
     cc->t_decode_us += ggml_time_us() - t_decode_start;
@@ -1118,7 +1264,7 @@ transcribe_status decode_from_committed_enc(MoonshineStreamingSession *   cc,
             return TRANSCRIBE_ERR_GGUF;
         }
         ggml_backend_sched_reset(cc->sched);
-        if (!ggml_backend_sched_alloc_graph(cc->sched, cross_db.graph)) {
+        if (!TRANSCRIBE_ALLOC_SCHED_GRAPH(cc->sched, cross_db.graph, "moonshine_streaming")) {
             transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
                                 "moonshine_streaming decode: cross_kv graph allocation failed — "
                                 "out of memory.");
@@ -1127,14 +1273,14 @@ transcribe_status decode_from_committed_enc(MoonshineStreamingSession *   cc,
         ggml_backend_tensor_set(cross_db.encoder_out_in, adapter_host.data(), 0, adapter_host.size() * sizeof(float));
         if (ggml_backend_sched_graph_compute(cc->sched, cross_db.graph) != GGML_STATUS_SUCCESS) {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "moonshine_streaming decode: cross_kv compute failed");
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_BACKEND;
         }
         cc->kv_cache.cross_populated = true;
         cc->t_decode_us += ggml_time_us() - t_xkv_start;
     }
 
     // 4. AR decoder loop.
-    return decode_from_kv_cache(cc, cm, T_enc, params, emit_dumps);
+    return decode_from_kv_cache(cc, cm, T_enc, params, emit_dumps, /*interim=*/false);
 }
 
 // Internal one-shot inference helper. Encoder over the full PCM, then
@@ -1167,10 +1313,20 @@ transcribe_status run_one_shot_inner(MoonshineStreamingSession *   cc,
     std::vector<float> pcm_padded       = right_pad_pcm(pcm, n_samples, hp.enc_frame_len);
     const int          n_samples_padded = static_cast<int>(pcm_padded.size());
 
+    // Reject before encoding: past the adapter's position table the model has
+    // no defined output (see adapter_max_frames).
+    if (const int T_needed = encoder_t_enc(hp, n_samples_padded); T_needed > adapter_max_frames(hp)) {
+        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
+                "moonshine_streaming run: input too long - %d encoder frames exceed the model's %d-frame limit "
+                "(%.1f s). Shorten the audio or stream it. See transcribe_capabilities.max_audio_ms.",
+                T_needed, adapter_max_frames(hp), static_cast<double>(moonshine_streaming_max_audio_ms(hp)) / 1000.0);
+        return TRANSCRIBE_ERR_INPUT_TOO_LONG;
+    }
+
     std::vector<float> enc_host;
     int                T_enc = 0;
-    if (auto st = encode_window_to_host(cc, cm, pcm_padded.data(), n_samples_padded,
-                                        /*emit_dumps=*/true, enc_host, T_enc);
+    if (auto st = encode_pcm_to_host(cc, cm, pcm_padded.data(), n_samples_padded,
+                                     /*emit_dumps=*/true, enc_host, T_enc);
         st != TRANSCRIBE_OK) {
         return st;
     }
@@ -1201,7 +1357,7 @@ transcribe_status run(transcribe_session *          session,
     // Remap truncation to a hard status only at this offline entry:
     // decode_from_kv_cache returns OK (it's shared with the streaming finalize
     // path, which must NOT surface OUTPUT_TRUNCATED). Partial text stays readable.
-    return cc->was_truncated ? TRANSCRIBE_ERR_OUTPUT_TRUNCATED : TRANSCRIBE_OK;
+    return cc->truncation_status();
 }
 
 // Streaming hooks.
@@ -1260,7 +1416,8 @@ void reset_result_text_only(MoonshineStreamingSession * cc) {
 transcribe_status decode_partial(MoonshineStreamingSession *   cc,
                                  MoonshineStreamingModel *     cm,
                                  const transcribe_run_params * params,
-                                 bool                          emit_dumps) {
+                                 bool                          emit_dumps,
+                                 bool                          interim) {
     const int T_enc = cc->stream_T_emitted;
     if (T_enc <= 0) {
         return TRANSCRIBE_ERR_INVALID_ARG;
@@ -1275,12 +1432,40 @@ transcribe_status decode_partial(MoonshineStreamingSession *   cc,
         st != TRANSCRIBE_OK) {
         return st;
     }
-    if (auto st = decode_from_kv_cache(cc, cm, T_enc, params, emit_dumps); st != TRANSCRIBE_OK) {
+    if (auto st = decode_from_kv_cache(cc, cm, T_enc, params, emit_dumps, interim); st != TRANSCRIBE_OK) {
         return st;
+    }
+    // decode_from_kv_cache resets the truncation flags to describe its own
+    // transcript; a stream that hit the input cap stays truncated regardless.
+    if (cc->stream_input_capped) {
+        cc->was_truncated = true;
     }
     cc->stream_last_decoded_T = T_enc;
     cc->enc_T                 = T_enc;
     return TRANSCRIBE_OK;
+}
+
+// Once every frame the adapter can position has been emitted, the stream is
+// at the model's input cap (see adapter_max_frames): flag it truncated, warn
+// once, and release the PCM nothing will read again. Later feeds drop their
+// audio; finalize decodes what was emitted.
+void mark_stream_input_capped_if_full(MoonshineStreamingSession * cc, MoonshineStreamingModel * cm) {
+    if (cc->stream_input_capped || cc->stream_T_emitted < adapter_max_frames(cm->hparams)) {
+        return;
+    }
+    cc->stream_input_capped = true;
+    cc->was_truncated       = true;
+    transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_WARN,
+                        "moonshine_streaming stream: input reached the model's %d-frame limit (%.1f s of audio); "
+                        "later audio is ignored and the transcript ends there. See "
+                        "transcribe_capabilities.max_audio_ms.",
+                        adapter_max_frames(cm->hparams),
+                        static_cast<double>(moonshine_streaming_max_audio_ms(cm->hparams)) / 1000.0);
+    // Keep stream_pcm_start_sample pointing past the dropped samples so the
+    // stream never looks empty to stream_finalize.
+    cc->stream_pcm_start_sample += static_cast<int64_t>(cc->stream_pcm_buffer.size());
+    cc->stream_pcm_buffer.clear();
+    cc->stream_pcm_buffer.shrink_to_fit();
 }
 
 std::vector<int32_t> token_ids_from_rows(const std::vector<transcribe_session::TokenEntry> & tokens) {
@@ -1414,6 +1599,7 @@ transcribe_status stream_begin(transcribe_session *             session,
     cc->stream_cross_v_committed.assign(static_cast<size_t>(hp.dec_n_layers), std::vector<float>{});
     cc->stream_T_emitted      = 0;
     cc->stream_last_decoded_T = 0;
+    cc->stream_input_capped   = false;
     cc->stream_token_id_history.clear();
     cc->stream_L_total_frames        = cumulative_left_context(hp);
     cc->stream_R_total_frames        = cumulative_right_context(hp);
@@ -1578,8 +1764,24 @@ transcribe_status stream_feed(transcribe_session *       session,
         return TRANSCRIBE_ERR_ABORTED;
     }
 
-    cc->stream_pcm_buffer.insert(cc->stream_pcm_buffer.end(), pcm, pcm + n_samples);
     cc->stream_audio_input_us += samples_to_us(n_samples);
+
+    // Past the input cap nothing more can be transcribed (see
+    // adapter_max_frames): drop the audio instead of buffering it, keep the
+    // last transcript, and report the stream as fully consumed.
+    if (cc->stream_input_capped) {
+        cc->stream_audio_committed_us = cc->stream_audio_input_us;
+        if (update != nullptr) {
+            update->result_changed     = false;
+            update->revision           = cc->stream_revision;
+            update->input_received_ms  = us_to_ms(cc->stream_audio_input_us);
+            update->audio_committed_ms = us_to_ms(cc->stream_audio_committed_us);
+            update->buffered_ms        = 0;
+        }
+        return TRANSCRIBE_OK;
+    }
+
+    cc->stream_pcm_buffer.insert(cc->stream_pcm_buffer.end(), pcm, pcm + n_samples);
 
     const int     spf              = cc->stream_samples_per_enc_frame;
     // total_pcm and available_frames are computed in ABSOLUTE frames
@@ -1589,7 +1791,7 @@ transcribe_status stream_feed(transcribe_session *       session,
     const int     R                = cc->stream_R_total_frames;
     const int     L                = cc->stream_L_total_frames;
 
-    const int stable_frames  = available_frames - R;
+    const int stable_frames  = std::min(available_frames - R, adapter_max_frames(cm->hparams));
     bool      result_changed = false;
     if (stable_frames > cc->stream_T_emitted) {
         const int emit_start = cc->stream_T_emitted;
@@ -1599,6 +1801,7 @@ transcribe_status stream_feed(transcribe_session *       session,
         if (auto st = flush_stable_frames(cc, cm, win_start, win_end, emit_start, emit_end); st != TRANSCRIBE_OK) {
             return st;
         }
+        mark_stream_input_capped_if_full(cc, cm);
         cc->stream_audio_committed_us =
             static_cast<int64_t>(cc->stream_T_emitted) * static_cast<int64_t>(spf) * 1000000LL / k_sample_rate_hz;
 
@@ -1624,7 +1827,7 @@ transcribe_status stream_feed(transcribe_session *       session,
             const std::string prev_full_text = cc->full_text;
 
             if (auto st = decode_partial(cc, cm, &cc->stream_run_params,
-                                         /*emit_dumps=*/false);
+                                         /*emit_dumps=*/false, /*interim=*/true);
                 st != TRANSCRIBE_OK) {
                 return st;
             }
@@ -1709,15 +1912,24 @@ transcribe_status stream_finalize(transcribe_session * session, transcribe_strea
             (st == TRANSCRIBE_OK) ? 0 : us_to_ms(cc->stream_audio_input_us - cc->stream_audio_committed_us);
     };
 
-    if (T_total > cc->stream_T_emitted) {
+    // The tail can still run past the input cap when the stream ended inside
+    // the last right-context window; emit up to the cap and report the rest
+    // as truncated (see adapter_max_frames).
+    const int T_emit_end = std::min(T_total, adapter_max_frames(hp));
+    if (T_emit_end > cc->stream_T_emitted) {
         const int emit_start = cc->stream_T_emitted;
-        const int emit_end   = T_total;
+        const int emit_end   = T_emit_end;
         const int win_start  = std::max(0, emit_start - cc->stream_L_total_frames);
-        const int win_end    = emit_end;
+        // Right context: the real audio past the cap when there is any, the end
+        // of the stream otherwise - exactly what a mid-stream flush would see.
+        const int win_end    = std::min(T_total, emit_end + cc->stream_R_total_frames);
         if (auto st = flush_stable_frames(cc, cm, win_start, win_end, emit_start, emit_end); st != TRANSCRIBE_OK) {
             write_update(st);
             return st;
         }
+    }
+    if (T_total > adapter_max_frames(hp)) {
+        mark_stream_input_capped_if_full(cc, cm);
     }
 
     const int T_enc = cc->stream_T_emitted;
@@ -1742,11 +1954,19 @@ transcribe_status stream_finalize(transcribe_session * session, transcribe_strea
     const std::string prev_full_text = cc->full_text;
     if (T_enc > cc->stream_last_decoded_T || !cc->has_result) {
         if (auto st = decode_partial(cc, cm, &cc->stream_run_params,
-                                     /*emit_dumps=*/true);
+                                     /*emit_dumps=*/true, /*interim=*/false);
             st != TRANSCRIBE_OK) {
             write_update(st);
             return st;
         }
+    } else if (cc->was_truncated && (cc->stopped_on_repetition || !cc->stream_input_capped)) {
+        // The last feed's interim decode is the final transcript, and it only
+        // logged its stop at DEBUG. (An input-cap stop already warned once.)
+        transcribe::log_msg(
+            TRANSCRIBE_LOG_LEVEL_WARN,
+            "moonshine_streaming stream: the final transcript %s before end-of-stream; it may be "
+            "incomplete.",
+            cc->stopped_on_repetition ? "stopped when the output began repeating" : "reached the generation budget");
     }
 
     // Commit the entire result at finalize: tokens, words, and
@@ -1790,6 +2010,7 @@ void stream_reset(transcribe_session * session) {
     }
     cc->stream_T_emitted      = 0;
     cc->stream_last_decoded_T = 0;
+    cc->stream_input_capped   = false;
     cc->stream_token_id_history.clear();
 }
 
@@ -1809,21 +2030,8 @@ transcribe_status run_batch_serial(MoonshineStreamingSession *   cc,
                                    const int *                   n_samples,
                                    int                           n,
                                    const transcribe_run_params * params) {
-    for (int i = 0; i < n; ++i) {
-        if (cc->poll_abort()) {
-            return TRANSCRIBE_ERR_ABORTED;
-        }
-        const transcribe_status st = (pcm[i] == nullptr || n_samples[i] <= 0) ? TRANSCRIBE_ERR_INVALID_ARG :
-                                                                                run(cc, pcm[i], n_samples[i], params);
-        if (st == TRANSCRIBE_OK) {
-            cc->batch_results.push_back(cc->capture_result(st));
-        } else {
-            transcribe_session::ResultSet rs;
-            rs.status = st;
-            cc->batch_results.push_back(std::move(rs));
-        }
-    }
-    return TRANSCRIBE_OK;
+    return transcribe::run_batch_serial(cc, pcm, n_samples, n,
+                                        [&](const float * p, int ns) { return run(cc, p, ns, params); });
 }
 
 transcribe_status run_batch(transcribe_session *          session,
@@ -1857,6 +2065,7 @@ transcribe_status run_batch(transcribe_session *          session,
 
     // ----- Pass 1: serial per-utterance encoder + adapter -----
     std::vector<char>               valid(n, 0);
+    std::vector<transcribe_status>  fail_status(n, TRANSCRIBE_ERR_INVALID_ARG);
     std::vector<std::vector<float>> adapter_hosts(n);
     std::vector<int>                T_enc(n, 0);
     int                             T_enc_max = 0;
@@ -1869,10 +2078,19 @@ transcribe_status run_batch(transcribe_session *          session,
             continue;
         }
         std::vector<float> pcm_padded = right_pad_pcm(pcm[b], n_samples[b], hp.enc_frame_len);
+        if (const int T_needed = encoder_t_enc(hp, static_cast<int>(pcm_padded.size()));
+            T_needed > adapter_max_frames(hp)) {
+            log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
+                    "moonshine_streaming run_batch: utterance %d input too long - %d encoder frames exceed the "
+                    "model's %d-frame limit. See transcribe_capabilities.max_audio_ms.",
+                    b, T_needed, adapter_max_frames(hp));
+            fail_status[b] = TRANSCRIBE_ERR_INPUT_TOO_LONG;
+            continue;
+        }
         std::vector<float> enc_host;
         int                t_enc_b = 0;
-        if (encode_window_to_host(cc, cm, pcm_padded.data(), static_cast<int>(pcm_padded.size()),
-                                  /*emit_dumps=*/false, enc_host, t_enc_b) != TRANSCRIBE_OK ||
+        if (encode_pcm_to_host(cc, cm, pcm_padded.data(), static_cast<int>(pcm_padded.size()),
+                               /*emit_dumps=*/false, enc_host, t_enc_b) != TRANSCRIBE_OK ||
             t_enc_b <= 0) {
             continue;
         }
@@ -1890,7 +2108,7 @@ transcribe_status run_batch(transcribe_session *          session,
     if (T_enc_max <= 0) {
         for (int b = 0; b < n; ++b) {
             transcribe_session::ResultSet rs;
-            rs.status = TRANSCRIBE_ERR_INVALID_ARG;
+            rs.status = fail_status[b];
             cc->batch_results.push_back(std::move(rs));
         }
         return TRANSCRIBE_OK;
@@ -1942,7 +2160,7 @@ transcribe_status run_batch(transcribe_session *          session,
             return TRANSCRIBE_ERR_GGUF;
         }
         ggml_backend_sched_reset(cc->sched);
-        if (!ggml_backend_sched_alloc_graph(cc->sched, cross.graph)) {
+        if (!TRANSCRIBE_ALLOC_SCHED_GRAPH(cc->sched, cross.graph, "moonshine_streaming")) {
             transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
                                 "moonshine_streaming run_batch: cross_kv graph allocation "
                                 "failed — out of memory.");
@@ -1958,7 +2176,7 @@ transcribe_status run_batch(transcribe_session *          session,
         }
         ggml_backend_tensor_set(cross.encoder_out_in, packed.data(), 0, packed.size() * sizeof(float));
         if (ggml_backend_sched_graph_compute(cc->sched, cross.graph) != GGML_STATUS_SUCCESS) {
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_BACKEND;
         }
         cc->kv_cache.cross_populated = true;
     }
@@ -1989,36 +2207,37 @@ transcribe_status run_batch(transcribe_session *          session,
     }
 
     StepBuildBatched sb{};
-    auto             rebuild_step = [&](int win) -> bool {
+    auto             rebuild_step = [&](int win) -> transcribe_status {
         if (!ensure_compute_ctx(cc, 16 * 1024 * 1024)) {
             transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
                                 "moonshine_streaming run_batch: compute context allocation "
                                 "failed (step) — out of memory.");
-            return false;
+            return TRANSCRIBE_ERR_OOM;
         }
         sb = build_step_graph_batched(cc->compute_ctx, cm->weights, hp, cc->kv_cache, win, T_enc_max, n,
                                       /*use_flash=*/true);
         if (sb.graph == nullptr || sb.argmax_out == nullptr) {
-            return false;
+            return TRANSCRIBE_ERR_GGUF;
         }
         ggml_backend_sched_reset(cc->sched);
-        if (!ggml_backend_sched_alloc_graph(cc->sched, sb.graph)) {
+        if (!TRANSCRIBE_ALLOC_SCHED_GRAPH(cc->sched, sb.graph, "moonshine_streaming")) {
             transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
                                 "moonshine_streaming run_batch: step graph allocation failed — "
                                 "out of memory.");
-            return false;
+            return TRANSCRIBE_ERR_OOM;
         }
         ggml_backend_tensor_set(sb.cross_mask_in, cmask.data(), 0, cmask.size() * sizeof(ggml_fp16_t));
-        return true;
+        return TRANSCRIBE_OK;
     };
-    if (!rebuild_step(kv_window)) {
-        return TRANSCRIBE_ERR_GGUF;
+    if (const transcribe_status st = rebuild_step(kv_window); st != TRANSCRIBE_OK) {
+        return st;
     }
 
     std::vector<ggml_fp16_t>          smask(static_cast<size_t>(kv_window) * n, f16_ninf);
     std::vector<int32_t>              tok_buf(n, 0), pos_buf(n, 0), argmax_buf(n, 0);
     std::vector<int64_t>              kvidx_buf(n, 0);
     std::vector<char>                 finished(n, 0);
+    std::vector<char>                 repeating(n, 0);
     std::vector<std::vector<int32_t>> generated(n);
     std::vector<int32_t>              next_tok(n, 0);
     for (int b = 0; b < n; ++b) {
@@ -2038,16 +2257,16 @@ transcribe_status run_batch(transcribe_session *          session,
         ggml_backend_tensor_set(sb.kv_idx_in, kvidx_buf.data(), 0, n * sizeof(int64_t));
         ggml_backend_tensor_set(sb.self_mask_in, smask.data(), 0, smask.size() * sizeof(ggml_fp16_t));
         if (ggml_backend_sched_graph_compute(cc->sched, sb.graph) != GGML_STATUS_SUCCESS) {
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_BACKEND;
         }
         ggml_backend_tensor_get(sb.argmax_out, argmax_buf.data(), 0, n * sizeof(int32_t));
         return TRANSCRIBE_OK;
     };
 
     // Grow the window (and rebuild the graph + mask) so position `pos` fits.
-    auto ensure_window = [&](int pos) -> bool {
+    auto ensure_window = [&](int pos) -> transcribe_status {
         if (pos + 1 <= kv_window) {
-            return true;
+            return TRANSCRIBE_OK;
         }
         int win = kv_window;
         while (win < pos + 1 && win < n_ctx_cap) {
@@ -2057,7 +2276,7 @@ transcribe_status run_batch(transcribe_session *          session,
             win = n_ctx_cap;
         }
         if (win == kv_window) {
-            return true;
+            return TRANSCRIBE_OK;
         }
         // Re-fill a wider mask: positions [0, pos) already written for all b.
         std::vector<ggml_fp16_t> wider(static_cast<size_t>(win) * n, f16_ninf);
@@ -2074,8 +2293,8 @@ transcribe_status run_batch(transcribe_session *          session,
     for (int b = 0; b < n; ++b) {
         tok_buf[b] = decoder_start;
     }
-    if (run_step(0) != TRANSCRIBE_OK) {
-        return TRANSCRIBE_ERR_GGUF;
+    if (const transcribe_status st = run_step(0); st != TRANSCRIBE_OK) {
+        return st;
     }
     for (int b = 0; b < n; ++b) {
         if (finished[b]) {
@@ -2102,14 +2321,14 @@ transcribe_status run_batch(transcribe_session *          session,
         if (all_done || pos + 1 > n_ctx_cap) {
             break;
         }
-        if (!ensure_window(pos)) {
-            return TRANSCRIBE_ERR_GGUF;
+        if (const transcribe_status st = ensure_window(pos); st != TRANSCRIBE_OK) {
+            return st;
         }
         for (int b = 0; b < n; ++b) {
             tok_buf[b] = finished[b] ? eos : next_tok[b];
         }
-        if (run_step(pos) != TRANSCRIBE_OK) {
-            return TRANSCRIBE_ERR_GGUF;
+        if (const transcribe_status st = run_step(pos); st != TRANSCRIBE_OK) {
+            return st;
         }
         for (int b = 0; b < n; ++b) {
             if (finished[b]) {
@@ -2120,6 +2339,11 @@ transcribe_status run_batch(transcribe_session *          session,
                 finished[b] = 1;
             } else {
                 generated[b].push_back(next_tok[b]);
+                if (transcribe::stop_on_repetition(generated[b], "moonshine_streaming run_batch")) {
+                    cc->was_truncated = true;
+                    finished[b]       = 1;
+                    repeating[b]      = 1;
+                }
             }
         }
     }
@@ -2127,12 +2351,13 @@ transcribe_status run_batch(transcribe_session *          session,
 
     // Batched truncation: a valid row that never reached eos exhausted the
     // output budget (n_ctx_cap = position cap clamped to cache capacity).
-    // Mirror the serial path (WARN + flag).
+    // Mirror the serial path (WARN + flag + repeating-tail trim).
     {
         int n_truncated = 0;
         for (int b = 0; b < n; ++b) {
             if (valid[b] && !finished[b]) {
                 ++n_truncated;
+                transcribe::trim_repetition_at_budget_stop(generated[b], "moonshine_streaming run_batch");
             }
         }
         if (n_truncated > 0) {
@@ -2150,7 +2375,7 @@ transcribe_status run_batch(transcribe_session *          session,
     for (int b = 0; b < n; ++b) {
         transcribe_session::ResultSet rs;
         if (!valid[b]) {
-            rs.status = TRANSCRIBE_ERR_INVALID_ARG;
+            rs.status = fail_status[b];
             cc->batch_results.push_back(std::move(rs));
             continue;
         }
@@ -2168,7 +2393,9 @@ transcribe_status run_batch(transcribe_session *          session,
         rs.result_kind = TRANSCRIBE_TIMESTAMPS_NONE;
         rs.has_result  = true;
         // Per-utterance truncation parity (offline run_batch, not streaming).
-        rs.status      = !finished[b] ? TRANSCRIBE_ERR_OUTPUT_TRUNCATED : TRANSCRIBE_OK;
+        rs.status      = repeating[b] ? TRANSCRIBE_ERR_OUTPUT_REPETITION :
+                         !finished[b] ? TRANSCRIBE_ERR_OUTPUT_TRUNCATED :
+                                        TRANSCRIBE_OK;
         rs.t_mel_us    = 0;
         rs.t_encode_us = enc_us / valid_count;
         rs.t_decode_us = dec_us / valid_count;

@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 1080" width="1080" height="1080">
+<title>Pyzhscriber SVG icon concepts</title>
+<rect width="1080" height="1080" fill="#000"/>
+<g font-family="Helvetica,Arial,sans-serif" fill="#fff">
+<text x="40" y="48" font-size="22" font-weight="600">Pyzhscriber / SVG concepts</text>
+<g transform="translate(40,150)">
+<svg x="20" y="0" width="256" height="256" viewBox="0 0 256 256"><rect x="40" y="80" width="176" height="96" rx="48" fill="#FF7426"/>
+<g stroke="#000" stroke-width="12" stroke-linecap="round">
+<path d="M80 119v18M104 106v44M128 96v64M152 110v36M176 119v18"/>
+</g></svg>
+<text x="20" y="287" font-size="17">01  Orange pill</text>
+<svg x="255" y="258" width="32" height="32" viewBox="0 0 256 256"><rect x="40" y="80" width="176" height="96" rx="48" fill="#FF7426"/>
+<g stroke="#000" stroke-width="12" stroke-linecap="round">
+<path d="M80 119v18M104 106v44M128 96v64M152 110v36M176 119v18"/>
+</g></svg>
+</g>
+<g transform="translate(390,150)">
+<svg x="20" y="0" width="256" height="256" viewBox="0 0 256 256"><path d="M72 208V52h69c39 0 63 21 63 54s-24 54-63 54h-29v48H72Zm40-84h27c17 0 25-6 25-18s-8-18-25-18h-27v36Z" fill="#397AFF"/>
+<path d="M72 172h40v36H72z" fill="#9BC4FF"/></svg>
+<text x="20" y="287" font-size="17">02  Cobalt P</text>
+<svg x="255" y="258" width="32" height="32" viewBox="0 0 256 256"><path d="M72 208V52h69c39 0 63 21 63 54s-24 54-63 54h-29v48H72Zm40-84h27c17 0 25-6 25-18s-8-18-25-18h-27v36Z" fill="#397AFF"/>
+<path d="M72 172h40v36H72z" fill="#9BC4FF"/></svg>
+</g>
+<g transform="translate(740,150)">
+<svg x="20" y="0" width="256" height="256" viewBox="0 0 256 256"><path d="M60 56h136a20 20 0 0 1 20 20v88a20 20 0 0 1-20 20h-76l-48 28v-28H60a20 20 0 0 1-20-20V76a20 20 0 0 1 20-20Z" fill="#FF635C"/>
+<path d="M80 96h96M80 120h72M80 144h44" fill="none" stroke="#000" stroke-width="12" stroke-linecap="round"/></svg>
+<text x="20" y="287" font-size="17">03  Coral transcript</text>
+<svg x="255" y="258" width="32" height="32" viewBox="0 0 256 256"><path d="M60 56h136a20 20 0 0 1 20 20v88a20 20 0 0 1-20 20h-76l-48 28v-28H60a20 20 0 0 1-20-20V76a20 20 0 0 1 20-20Z" fill="#FF635C"/>
+<path d="M80 96h96M80 120h72M80 144h44" fill="none" stroke="#000" stroke-width="12" stroke-linecap="round"/></svg>
+</g>
+<g transform="translate(40,610)">
+<svg x="20" y="0" width="256" height="256" viewBox="0 0 256 256"><rect x="102" y="44" width="52" height="108" rx="26" fill="#C2F64B"/>
+<path d="M78 124v8a50 50 0 0 0 100 0v-8M128 182v26M103 208h50" fill="none" stroke="#C2F64B" stroke-width="14" stroke-linecap="round"/>
+<path d="M118 71h20M118 92h20M118 113h20" stroke="#000" stroke-width="7" stroke-linecap="round"/></svg>
+<text x="20" y="287" font-size="17">04  Lime microphone</text>
+<svg x="255" y="258" width="32" height="32" viewBox="0 0 256 256"><rect x="102" y="44" width="52" height="108" rx="26" fill="#C2F64B"/>
+<path d="M78 124v8a50 50 0 0 0 100 0v-8M128 182v26M103 208h50" fill="none" stroke="#C2F64B" stroke-width="14" stroke-linecap="round"/>
+<path d="M118 71h20M118 92h20M118 113h20" stroke="#000" stroke-width="7" stroke-linecap="round"/></svg>
+</g>
+<g transform="translate(390,610)">
+<svg x="20" y="0" width="256" height="256" viewBox="0 0 256 256"><g stroke="#FFC34B" stroke-width="18" stroke-linecap="round">
+<path d="M56 118v20M88 92v72M120 104v48"/>
+</g>
+<path d="M158 66h42M179 66v124M158 190h42" fill="none" stroke="#FFF3D6" stroke-width="12" stroke-linecap="square"/></svg>
+<text x="20" y="287" font-size="17">05  Voice to type</text>
+<svg x="255" y="258" width="32" height="32" viewBox="0 0 256 256"><g stroke="#FFC34B" stroke-width="18" stroke-linecap="round">
+<path d="M56 118v20M88 92v72M120 104v48"/>
+</g>
+<path d="M158 66h42M179 66v124M158 190h42" fill="none" stroke="#FFF3D6" stroke-width="12" stroke-linecap="square"/></svg>
+</g>
+<g transform="translate(740,610)">
+<svg x="20" y="0" width="256" height="256" viewBox="0 0 256 256"><path d="m48 208 30-102L192 48l16 16-58 114L48 208Z" fill="#36DEC4"/>
+<path d="m48 208 80-80" stroke="#000" stroke-width="12"/>
+<circle cx="134" cy="122" r="16" fill="#000"/>
+<path d="m166 62 28 28 14-26-16-16-26 14Z" fill="#A6FFEA"/></svg>
+<text x="20" y="287" font-size="17">06  Teal nib</text>
+<svg x="255" y="258" width="32" height="32" viewBox="0 0 256 256"><path d="m48 208 30-102L192 48l16 16-58 114L48 208Z" fill="#36DEC4"/>
+<path d="m48 208 80-80" stroke="#000" stroke-width="12"/>
+<circle cx="134" cy="122" r="16" fill="#000"/>
+<path d="m166 62 28 28 14-26-16-16-26 14Z" fill="#A6FFEA"/></svg>
+</g>
+</g></svg>

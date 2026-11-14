@@ -8,6 +8,7 @@
 
 #include "transcribe-backend.h"
 #include "transcribe-kaldi-fbank.h"
+#include "transcribe-load-common.h"
 #include "transcribe-model.h"
 #include "transcribe-session.h"
 #include "transcribe-tokenizer.h"
@@ -33,8 +34,8 @@ struct SenseVoiceModel final : public transcribe_model {
     SenseVoiceWeights     weights;
     ggml_context *        ctx_meta = nullptr;
 
-    transcribe::BackendPlan plan;
-    ggml_backend_buffer_t   backend_buffer = nullptr;
+    transcribe::BackendPlan                plan;
+    transcribe::load_common::WeightStorage weight_storage;
 
     // Constructed once at load() time; const-after-construction so
     // every context that derives from this model can share the cached
@@ -49,9 +50,6 @@ struct SenseVoiceModel final : public transcribe_model {
 
 struct SenseVoiceSession final : public transcribe_session {
     // Per-call compute state. Reset at the top of every run() call.
-    ggml_context *       compute_ctx = nullptr;
-    ggml_backend_sched_t sched       = nullptr;
-
     // Reusable host scratch.
     std::vector<float>   frontend_buf;  // [T_lfr, d_input]
     std::vector<float>   pe_buf;        // [T, d_input]

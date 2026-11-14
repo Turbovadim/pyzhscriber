@@ -1,7 +1,8 @@
 use crate::audio::AudioRecorder;
+use crate::cloud::LiveSession;
 use crate::history::{HistoryEntry, HistoryStore};
 use crate::hotkey::{self, KeyEvent, RecorderStep, Shortcut, ShortcutRecorder};
-use crate::models::{ModelChoice, ModelRegistry};
+use crate::models::{DownloadError, ModelChoice, ModelRegistry};
 use crate::output;
 use crate::post_process;
 use crate::settings::{AppSettings, SettingsStore, TranscriptionMode};
@@ -47,17 +48,37 @@ pub enum ShortcutCapture {
 pub enum RuntimeEvent {
     Status(RuntimeStatus),
     Transcript(HistoryEntry),
-    Settings(AppSettings),
+    Settings(Box<AppSettings>),
     ShortcutCapture(ShortcutCapture),
-    DownloadProgress { model_id: String, progress: f32 },
+    DownloadProgress {
+        model_id: String,
+        progress: f32,
+    },
+    /// A download ended without a new model, by failure or cancel.
+    DownloadStopped {
+        model_id: String,
+    },
     ModelsChanged(Vec<ModelChoice>),
+}
+
+struct Transcription {
+    text: String,
+    /// What produced the text, recorded in history.
+    source: String,
+    /// Set when the cloud failed and a local model stood in.
+    cloud_error: Option<anyhow::Error>,
 }
 
 pub struct AppController {
     settings: RwLock<AppSettings>,
+    /// Parsed from `settings.shortcut` on save, so the global key tap does not
+    /// re-parse it for every key typed in any app.
+    shortcut: RwLock<Option<Shortcut>>,
     settings_store: SettingsStore,
     pub models: Arc<ModelRegistry>,
     recorder: AudioRecorder,
+    /// Fed by the recorder while a streaming cloud model is in use.
+    live_session: Mutex<Option<LiveSession>>,
     transcriber: Arc<Transcriber>,
     pub history: HistoryStore,
     status: RwLock<RuntimeStatus>,
@@ -68,21 +89,31 @@ pub struct AppController {
     shortcut_listener_started: AtomicBool,
     shortcut_recorder: Mutex<Option<ShortcutRecorder>>,
     activity_generation: Arc<AtomicU64>,
+    /// Cancel flags of in-flight model downloads, keyed by model id.
+    downloads: Mutex<std::collections::HashMap<String, Arc<AtomicBool>>>,
 }
 
 impl AppController {
     pub fn new() -> Result<Arc<Self>> {
         let settings_store = SettingsStore::new()?;
-        let settings = settings_store.load()?;
+        let mut settings = settings_store.load()?;
         let models = Arc::new(ModelRegistry::new()?);
+        // Settings may name a non-default quant (e.g. imported from Handy); the
+        // app tracks models by their default-file id and resolves the quant.
+        settings.selected_model = models.canonical_id(&settings.selected_model);
+        for route in &mut settings.routes {
+            route.model = models.canonical_id(&route.model);
+        }
         let transcriber = Arc::new(Transcriber::new(models.clone()));
         let history = HistoryStore::new()?;
         let (event_tx, event_rx) = async_channel::unbounded();
         Ok(Arc::new(Self {
+            shortcut: RwLock::new(parse_shortcut(&settings.shortcut)),
             settings: RwLock::new(settings),
             settings_store,
             models,
             recorder: AudioRecorder::new(),
+            live_session: Mutex::new(None),
             transcriber,
             history,
             status: RwLock::new(RuntimeStatus::Idle),
@@ -93,6 +124,7 @@ impl AppController {
             shortcut_listener_started: AtomicBool::new(false),
             shortcut_recorder: Mutex::new(None),
             activity_generation: Arc::new(AtomicU64::new(0)),
+            downloads: Mutex::new(std::collections::HashMap::new()),
         }))
     }
 
@@ -132,8 +164,11 @@ impl AppController {
             startup::set_enabled(settings.autostart_enabled)?;
         }
         self.settings_store.save(&settings)?;
+        *self.shortcut.write() = parse_shortcut(&settings.shortcut);
         *self.settings.write() = settings.clone();
-        let _ = self.event_tx.try_send(RuntimeEvent::Settings(settings));
+        let _ = self
+            .event_tx
+            .try_send(RuntimeEvent::Settings(Box::new(settings)));
         Ok(())
     }
 
@@ -206,19 +241,31 @@ impl AppController {
         }
         let settings = self.settings();
         self.activity_generation.fetch_add(1, Ordering::SeqCst);
-        match self.recorder.start(settings.selected_microphone.as_deref()) {
+        let (session, tap) = if settings.cloud_enabled && crate::cloud::streams(&settings) {
+            let (session, tap) = LiveSession::start(&settings);
+            (Some(session), Some(tap))
+        } else {
+            (None, None)
+        };
+        match self
+            .recorder
+            .start(settings.selected_microphone.as_deref(), tap)
+        {
             Ok(()) => {
+                *self.live_session.lock() = session;
                 if settings.audio_feedback {
                     sound::play(FeedbackSound::Start);
                 }
                 log::info!("recording started");
                 self.set_status(RuntimeStatus::Recording);
-                let transcriber = self.transcriber.clone();
-                std::thread::spawn(move || {
-                    if let Err(error) = transcriber.preload_for(&settings) {
-                        log::warn!("model preload failed: {error:#}");
-                    }
-                });
+                if !settings.cloud_enabled {
+                    let transcriber = self.transcriber.clone();
+                    std::thread::spawn(move || {
+                        if let Err(error) = transcriber.preload_for(&settings) {
+                            log::warn!("model preload failed: {error:#}");
+                        }
+                    });
+                }
             }
             Err(error) => self.set_status(RuntimeStatus::Error(error.to_string())),
         }
@@ -229,6 +276,7 @@ impl AppController {
             log::info!("stop requested while no recording was active");
             return;
         }
+        let session = self.live_session.lock().take();
         let audio = match self.recorder.stop() {
             Ok(audio) => audio,
             Err(error) => {
@@ -241,11 +289,12 @@ impl AppController {
         }
         self.set_status(RuntimeStatus::Transcribing);
         let controller = self.clone();
-        std::thread::spawn(move || controller.finish_transcription(audio));
+        std::thread::spawn(move || controller.finish_transcription(audio, session));
     }
 
     pub fn cancel(&self) {
         self.recorder.cancel();
+        self.live_session.lock().take();
         self.set_status(RuntimeStatus::Idle);
     }
 
@@ -257,29 +306,98 @@ impl AppController {
         self.transcriber.loaded_model_id()
     }
 
+    /// CLI jobs reuse the model, but never insert text or change saved settings/history.
+    pub fn transcribe_file(
+        &self,
+        file: &std::path::Path,
+        options: &crate::cli::TranscribeOptions,
+    ) -> Result<String> {
+        anyhow::ensure!(
+            !self.shutting_down.load(Ordering::SeqCst),
+            "app is shutting down"
+        );
+        let mut settings = self.settings();
+        options.apply(&mut settings);
+        let audio = crate::cli::read_audio(file)?;
+        self.activity_generation.fetch_add(1, Ordering::SeqCst);
+        let result = self
+            .transcribe_audio(&audio, &settings, None)
+            .map(|done| done.text);
+        if !self.recorder.is_recording() {
+            self.schedule_model_unload(settings.model_unload_minutes);
+        }
+        result
+    }
+
+    /// Starts a background download; a second request for the same model
+    /// while one is running is ignored.
     pub fn download_model(self: &Arc<Self>, model_id: String) {
+        let cancel = Arc::new(AtomicBool::new(false));
+        {
+            let mut downloads = self.downloads.lock();
+            if downloads.contains_key(&model_id) {
+                return;
+            }
+            downloads.insert(model_id.clone(), cancel.clone());
+        }
         let controller = self.clone();
         std::thread::spawn(move || {
-            let id_for_progress = model_id.clone();
             let sender = controller.event_tx.clone();
-            let result = controller.models.download(&model_id, move |progress| {
-                let _ = sender.try_send(RuntimeEvent::DownloadProgress {
-                    model_id: id_for_progress.clone(),
-                    progress,
+            let id_for_progress = model_id.clone();
+            let result = controller
+                .models
+                .download(&model_id, &cancel, move |progress| {
+                    let _ = sender.try_send(RuntimeEvent::DownloadProgress {
+                        model_id: id_for_progress.clone(),
+                        progress,
+                    });
                 });
-            });
+            controller.downloads.lock().remove(&model_id);
             match result {
-                Ok(_) => {
-                    let _ = controller.event_tx.try_send(RuntimeEvent::ModelsChanged(
-                        controller.models.default_choices(),
-                    ));
+                Ok(_) => {}
+                Err(DownloadError::Cancelled) => {
+                    log::info!("download of {model_id} cancelled");
+                    let _ = controller
+                        .event_tx
+                        .try_send(RuntimeEvent::DownloadStopped { model_id });
                 }
-                Err(error) => controller.set_status(RuntimeStatus::Error(error.to_string())),
+                Err(DownloadError::Failed(error)) => {
+                    let _ = controller
+                        .event_tx
+                        .try_send(RuntimeEvent::DownloadStopped { model_id });
+                    controller.set_status(RuntimeStatus::Error(format!("{error:#}")));
+                }
             }
+            controller.refresh_models();
         });
     }
 
-    fn finish_transcription(&self, audio: Vec<f32>) {
+    /// Stops a running download, keeping its partial file for a later resume.
+    pub fn cancel_download(&self, model_id: &str) {
+        if let Some(cancel) = self.downloads.lock().get(model_id) {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Deletes a model's files from our models folder. Loaded models are
+    /// dropped first, since the removed file may back the transcriber or the
+    /// language detector; they reload on next use.
+    pub fn remove_model(&self, model_id: &str) -> Result<()> {
+        self.transcriber.unload();
+        let result = self.models.remove(model_id);
+        self.refresh_models();
+        result
+    }
+
+    /// Re-reads install state from disk, picking up models added elsewhere.
+    pub fn refresh_models(&self) {
+        let _ = self
+            .event_tx
+            .try_send(RuntimeEvent::ModelsChanged(self.models.choices()));
+    }
+
+    /// `session` has already received this audio while it was recorded.
+    fn finish_transcription(&self, audio: Vec<f32>, session: Option<LiveSession>) {
         let settings = self.settings();
         let captured = audio.len();
         let mut audio = if settings.vad_enabled {
@@ -301,45 +419,106 @@ impl AppController {
             captured as f64 / 16_000.0,
             audio.len() as f64 / 16_000.0
         );
-        let model_id = match settings.transcription_mode {
-            TranscriptionMode::Single => settings.selected_model.clone(),
-            TranscriptionMode::Routed => {
-                format!("automatic {}-language routing", settings.routes.len())
-            }
-        };
         let result = self
-            .transcriber
-            .transcribe(&audio, &settings)
-            .and_then(|text| post_process::clean(&text, &settings))
-            .and_then(|text| {
+            .transcribe_audio(&audio, &settings, session)
+            .and_then(|done| {
+                let mut text = post_process::clean(&done.text, &settings)?;
                 if self.shutting_down.load(Ordering::SeqCst) || text.trim().is_empty() {
-                    return Ok(None);
+                    return Ok((None, done));
+                }
+                // Added after cleanup, which re-joins words and would drop it.
+                if settings.append_trailing_space {
+                    text.push(' ');
                 }
                 output::deliver(&text, &settings)?;
-                let entry =
-                    self.history
-                        .add(&text, &model_id, None, audio.len() as f64 / 16_000.0)?;
-                let _ = self.history.save_recording(&audio);
-                Ok(Some(entry))
+                Ok((Some(text), done))
             });
 
         match result {
-            Ok(Some(entry)) => {
-                log::info!(
-                    "transcribed {:.1}s of audio into {} characters",
-                    entry.audio_seconds,
-                    entry.text.chars().count()
-                );
-                let _ = self.event_tx.try_send(RuntimeEvent::Transcript(entry));
-                self.set_status(RuntimeStatus::Idle);
+            Ok((Some(text), done)) => {
+                // The text is already in place, so the pill leaves before the
+                // bookkeeping below rather than after it.
+                match done.cloud_error {
+                    Some(error) => self.set_status(RuntimeStatus::Error(format!(
+                        "Cloud dictation failed, so a local model was used: {error:#}"
+                    ))),
+                    None => self.set_status(RuntimeStatus::Idle),
+                }
                 self.schedule_model_unload(settings.model_unload_minutes);
+                let audio_seconds = audio.len() as f64 / 16_000.0;
+                log::info!(
+                    "transcribed {audio_seconds:.1}s of audio into {} characters",
+                    text.chars().count()
+                );
+                match self
+                    .history
+                    .add(text.trim_end(), &done.source, None, audio_seconds)
+                {
+                    Ok(entry) => {
+                        let _ = self.event_tx.try_send(RuntimeEvent::Transcript(entry));
+                    }
+                    Err(error) => log::error!("failed to save transcript history: {error:#}"),
+                }
+                if let Err(error) = self.history.save_recording(&audio) {
+                    log::warn!("failed to save recording: {error:#}");
+                }
             }
-            Ok(None) => {
+            Ok((None, _)) => {
                 log::info!("transcription produced no text");
                 self.set_status(RuntimeStatus::Idle);
                 self.schedule_model_unload(settings.model_unload_minutes);
             }
             Err(error) => self.set_status(RuntimeStatus::Error(format!("{error:#}"))),
+        }
+    }
+
+    /// Transcribes through the cloud when enabled, falling back to local
+    /// models so a network or billing problem does not lose the dictation.
+    /// When both fail, the cloud error is the one worth reporting. A live
+    /// session already holds the audio, so only its transcript is awaited.
+    fn transcribe_audio(
+        &self,
+        audio: &[f32],
+        settings: &AppSettings,
+        session: Option<LiveSession>,
+    ) -> Result<Transcription> {
+        let local_source = || match settings.transcription_mode {
+            TranscriptionMode::Single => settings.selected_model.clone(),
+            TranscriptionMode::Routed => {
+                format!("automatic {}-language routing", settings.routes.len())
+            }
+        };
+        if !settings.cloud_enabled {
+            return Ok(Transcription {
+                text: self.transcriber.transcribe(audio, settings)?,
+                source: local_source(),
+                cloud_error: None,
+            });
+        }
+        let cloud = match session {
+            Some(session) => session.finish(),
+            None => crate::cloud::transcribe(audio, settings),
+        };
+        match cloud {
+            Ok(text) => Ok(Transcription {
+                text,
+                source: crate::cloud::source(settings),
+                cloud_error: None,
+            }),
+            Err(cloud_error) => {
+                log::warn!("cloud transcription failed, trying local models: {cloud_error:#}");
+                match self.transcriber.transcribe(audio, settings) {
+                    Ok(text) => Ok(Transcription {
+                        text,
+                        source: local_source(),
+                        cloud_error: Some(cloud_error),
+                    }),
+                    Err(local_error) => {
+                        log::warn!("local fallback failed: {local_error:#}");
+                        Err(cloud_error)
+                    }
+                }
+            }
         }
     }
 
@@ -396,15 +575,14 @@ impl AppController {
         if self.feed_shortcut_recorder(event) {
             return;
         }
-        let settings = self.settings();
-        let Some(shortcut) = Shortcut::parse(&settings.shortcut) else {
-            log::warn!("unknown shortcut binding {:?}", settings.shortcut);
+        let Some(shortcut) = *self.shortcut.read() else {
             return;
         };
+        let push_to_talk = self.settings.read().push_to_talk;
         if shortcut.is_pressed(event) {
             if !self.shortcut_down.swap(true, Ordering::SeqCst) {
-                log::info!("shortcut {} pressed", settings.shortcut);
-                if settings.push_to_talk {
+                log::info!("shortcut {shortcut} pressed");
+                if push_to_talk {
                     self.start_recording();
                 } else {
                     self.toggle_recording();
@@ -416,10 +594,18 @@ impl AppController {
             }
             self.cancel();
         } else if shortcut.is_released(event) && self.shortcut_down.swap(false, Ordering::SeqCst) {
-            log::info!("shortcut {} released", settings.shortcut);
-            if settings.push_to_talk {
+            log::info!("shortcut {shortcut} released");
+            if push_to_talk {
                 self.stop_recording();
             }
         }
     }
+}
+
+fn parse_shortcut(binding: &str) -> Option<Shortcut> {
+    let shortcut = Shortcut::parse(binding);
+    if shortcut.is_none() {
+        log::warn!("unknown shortcut binding {binding:?}");
+    }
+    shortcut
 }

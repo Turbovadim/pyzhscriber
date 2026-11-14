@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <clipPath id="tile">
+      <rect x="100" y="100" width="824" height="824" rx="185"/>
+    </clipPath>
+    <radialGradient id="fur" cx="0.42" cy="0.3" r="0.8">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="0.55" stop-color="#EEF1F7"/>
+      <stop offset="1" stop-color="#C3CCDB"/>
+    </radialGradient>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#171A23"/>
+      <stop offset="1" stop-color="#000000"/>
+    </linearGradient>
+    <pattern id="plaid" width="72" height="72" patternUnits="userSpaceOnUse" patternTransform="rotate(-6)">
+      <rect width="72" height="72" fill="#F4C350"/>
+      <rect x="0" y="24" width="72" height="14" fill="#7D8DB4" opacity="0.7"/>
+      <rect x="24" y="0" width="14" height="72" fill="#7D8DB4" opacity="0.7"/>
+      <rect x="0" y="54" width="72" height="4" fill="#FFF3CC" opacity="0.8"/>
+      <rect x="54" y="0" width="4" height="72" fill="#FFF3CC" opacity="0.8"/>
+    </pattern>
+    <clipPath id="eyeL"><ellipse cx="390" cy="530" rx="72" ry="60"/></clipPath>
+    <clipPath id="eyeR"><ellipse cx="634" cy="530" rx="72" ry="60"/></clipPath>
+  </defs>
+
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#bg)"/>
+
+  <g clip-path="url(#tile)" stroke="#000" stroke-linejoin="round" stroke-linecap="round">
+    <path d="M200 800 C 180 860 170 920 160 1000 L 864 1000 C 854 920 844 860 824 800 Z" fill="url(#fur)" stroke-width="22"/>
+
+    <path d="M512 292 C 724 292 840 414 840 566 C 840 686 792 764 720 806 L 304 806 C 232 764 184 686 184 566 C 184 414 300 292 512 292 Z" fill="url(#fur)" stroke-width="22"/>
+
+    <ellipse cx="300" cy="650" rx="46" ry="24" fill="#F7A6B9" opacity="0.75" stroke="none"/>
+    <ellipse cx="724" cy="650" rx="46" ry="24" fill="#F7A6B9" opacity="0.75" stroke="none"/>
+
+    <!-- eyes: pupils glancing sideways under heavy smug lids -->
+    <ellipse cx="390" cy="530" rx="72" ry="60" fill="#fff" stroke="none"/>
+    <ellipse cx="634" cy="530" rx="72" ry="60" fill="#fff" stroke="none"/>
+    <g clip-path="url(#eyeL)" stroke="none">
+      <circle cx="412" cy="554" r="44" fill="#1A1D2B"/>
+      <circle cx="412" cy="554" r="44" fill="none" stroke="#7FB7E8" stroke-width="9"/>
+      <circle cx="428" cy="564" r="11" fill="#fff"/>
+      <rect x="310" y="460" width="160" height="64" fill="#DCE2EC"/>
+    </g>
+    <g clip-path="url(#eyeR)" stroke="none">
+      <circle cx="656" cy="554" r="44" fill="#1A1D2B"/>
+      <circle cx="656" cy="554" r="44" fill="none" stroke="#7FB7E8" stroke-width="9"/>
+      <circle cx="672" cy="564" r="11" fill="#fff"/>
+      <rect x="554" y="460" width="160" height="64" fill="#DCE2EC"/>
+    </g>
+    <ellipse cx="390" cy="530" rx="72" ry="60" fill="none" stroke-width="14"/>
+    <ellipse cx="634" cy="530" rx="72" ry="60" fill="none" stroke-width="14"/>
+    <path d="M314 522 Q 390 512 466 524" fill="none" stroke-width="18"/>
+    <path d="M558 524 Q 634 512 710 522" fill="none" stroke-width="18"/>
+
+    <!-- muzzle pads, nose, mouth -->
+    <ellipse cx="468" cy="676" rx="58" ry="42" fill="#FFFFFF" stroke="#B6C0D1" stroke-width="6"/>
+    <ellipse cx="556" cy="676" rx="58" ry="42" fill="#FFFFFF" stroke="#B6C0D1" stroke-width="6"/>
+    <g fill="#8E98AE" stroke="none">
+      <circle cx="446" cy="668" r="7"/><circle cx="426" cy="690" r="7"/><circle cx="458" cy="698" r="7"/>
+      <circle cx="578" cy="668" r="7"/><circle cx="598" cy="690" r="7"/><circle cx="566" cy="698" r="7"/>
+    </g>
+    <path d="M462 616 Q 512 596 562 616 Q 560 650 512 672 Q 464 650 462 616 Z" fill="#0B0B10" stroke-width="6"/>
+    <ellipse cx="492" cy="621" rx="15" ry="7" fill="#5A5F75" stroke="none"/>
+    <path d="M512 672 L 512 690 M 480 690 Q 496 712 512 690 Q 528 712 544 690" fill="none" stroke-width="11"/>
+
+    <path d="M180 772 Q 512 864 844 772 L 860 866 Q 512 964 164 866 Z" fill="url(#plaid)" stroke-width="22"/>
+
+    <!-- headset -->
+    <path d="M214 572 C 202 168 822 168 810 572" fill="none" stroke-width="44"/>
+    <path d="M236 470 C 262 236 762 236 788 470" fill="none" stroke="#2A2E3A" stroke-width="9"/>
+    <rect x="152" y="474" width="98" height="196" rx="46" fill="#16181F" stroke-width="18"/>
+    <rect x="774" y="474" width="98" height="196" rx="46" fill="#16181F" stroke-width="18"/>
+    <rect x="172" y="506" width="20" height="124" rx="10" fill="#F4C350" stroke="none"/>
+    <rect x="832" y="506" width="20" height="124" rx="10" fill="#F4C350" stroke="none"/>
+    <path d="M214 662 C 226 744 300 762 376 754" fill="none" stroke-width="20"/>
+    <rect x="368" y="730" width="76" height="48" rx="24" fill="#16181F" stroke-width="14"/>
+    <rect x="386" y="746" width="40" height="16" rx="8" fill="#F4C350" stroke="none"/>
+  </g>
+</svg>

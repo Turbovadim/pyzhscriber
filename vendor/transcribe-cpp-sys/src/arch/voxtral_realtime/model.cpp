@@ -13,6 +13,7 @@
 #include "ggml.h"
 #include "gguf.h"
 #include "transcribe-arch.h"
+#include "transcribe-backend.h"
 #include "transcribe-batch-util.h"
 #include "transcribe-debug.h"
 #include "transcribe-env.h"
@@ -61,14 +62,6 @@ Session::~Session() {
         ggml_free(ada_ctx);
         ada_ctx = nullptr;
     }
-    if (sched != nullptr) {
-        safe_sched_free(sched);
-        sched = nullptr;
-    }
-    if (compute_ctx != nullptr) {
-        ggml_free(compute_ctx);
-        compute_ctx = nullptr;
-    }
 }
 
 Model::~Model() {
@@ -76,10 +69,7 @@ Model::~Model() {
         ggml_free(ctx_meta);
         ctx_meta = nullptr;
     }
-    if (backend_buffer != nullptr) {
-        safe_buffer_free(backend_buffer);
-        backend_buffer = nullptr;
-    }
+    weight_storage.reset();
     packed_gate_up.free();
     for (auto it = plan.scheduler_list.rbegin(); it != plan.scheduler_list.rend(); ++it) {
         safe_backend_free(*it);
@@ -92,6 +82,9 @@ Model::~Model() {
 namespace {
 
 constexpr const char k_default_variant[] = "voxtral-mini-4b-realtime-2602";
+
+// Offline inference has no latency tradeoff, so use the best evaluated delay.
+constexpr int k_offline_num_delay_tokens = 30;
 
 // Resolve BOS / STREAMING_PAD / EOS against the loaded tokenizer.
 transcribe_status resolve_specials(const transcribe::Tokenizer & tok, const HParams & hp, PromptSpecials & out) {
@@ -267,17 +260,8 @@ transcribe_status load(Loader & loader, const transcribe_model_load_params * par
     m->backend         = ggml_backend_name(m->plan.primary);
     m->primary_backend = m->plan.primary;
 
-    ggml_backend_buffer_t weights_buffer = ggml_backend_alloc_ctx_tensors(m->ctx_meta, m->plan.primary);
-    if (weights_buffer == nullptr) {
-        gguf_free(gguf_data);
-        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "voxtral_realtime: ggml_backend_alloc_ctx_tensors failed");
-        return TRANSCRIBE_ERR_GGUF;
-    }
-    m->backend_buffer = weights_buffer;
-    ggml_backend_buffer_set_usage(weights_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-
-    if (auto st =
-            transcribe::load_common::stream_tensor_data(loader.path(), gguf_data, m->ctx_meta, "voxtral_realtime");
+    if (const transcribe_status st = transcribe::load_common::load_weights(
+            loader.path(), gguf_data, m->ctx_meta, m->plan, params, "voxtral_realtime", m->weight_storage);
         st != TRANSCRIBE_OK) {
         gguf_free(gguf_data);
         return st;
@@ -292,10 +276,12 @@ transcribe_status load(Loader & loader, const transcribe_model_load_params * par
         for (auto & b : m->weights.dec_blocks) {
             entries.push_back({ b.ffn_gate_w, b.ffn_up_w, &b.ffn_gate_up_w });
         }
-        if (!transcribe::causal_lm::pack_gate_up(m->plan.primary, m->hparams.dec_hidden, m->hparams.dec_intermediate,
-                                                 entries, m->packed_gate_up, "voxtral_realtime")) {
+        if (const transcribe_status st =
+                transcribe::causal_lm::pack_gate_up(m->plan.primary, m->hparams.dec_hidden, m->hparams.dec_intermediate,
+                                                    entries, m->packed_gate_up, "voxtral_realtime");
+            st != TRANSCRIBE_OK) {
             m->packed_gate_up.free();
-            return TRANSCRIBE_ERR_GGUF;
+            return st;
         }
     }
 
@@ -388,7 +374,7 @@ transcribe_status compute_ada_scales(Session * cc, Model * cm, int num_delay) {
     ggml_set_name(cc->ada_scale_all, "ada.scale_all");
     cc->ada_buffer = ggml_backend_alloc_ctx_tensors(cc->ada_ctx, cm->plan.primary);
     if (cc->ada_buffer == nullptr) {
-        return TRANSCRIBE_ERR_GGUF;
+        return TRANSCRIBE_ERR_OOM;
     }
 
     // Build a one-shot compute graph: per layer ada_l = linear2(gelu(linear1(t))).
@@ -423,11 +409,11 @@ transcribe_status compute_ada_scales(Session * cc, Model * cm, int num_delay) {
                                            static_cast<int>(cm->plan.scheduler_list.size()), 16384, false, true);
         if (cc->sched == nullptr) {
             ggml_free(ctx);
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_BACKEND;
         }
     }
     ggml_backend_sched_reset(cc->sched);
-    if (!ggml_backend_sched_alloc_graph(cc->sched, gf)) {
+    if (!TRANSCRIBE_ALLOC_SCHED_GRAPH(cc->sched, gf, "voxtral_realtime")) {
         transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
                             "voxtral_realtime: ada-scale graph allocation failed — "
                             "out of memory.");
@@ -438,7 +424,7 @@ transcribe_status compute_ada_scales(Session * cc, Model * cm, int num_delay) {
     apply_threads(cc->sched, cc->n_threads);
     if (ggml_backend_sched_graph_compute(cc->sched, gf) != GGML_STATUS_SUCCESS) {
         ggml_free(ctx);
-        return TRANSCRIBE_ERR_GGUF;
+        return TRANSCRIBE_ERR_BACKEND;
     }
 
     std::vector<float> ada(static_cast<size_t>(hidden) * n_layer);
@@ -540,7 +526,7 @@ transcribe_status forward_buffer(Session *     cc,
         cc->sched = ggml_backend_sched_new(cm->plan.scheduler_list.data(), nullptr,
                                            static_cast<int>(cm->plan.scheduler_list.size()), 16384, false, true);
         if (cc->sched == nullptr) {
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_BACKEND;
         }
     }
 
@@ -571,7 +557,7 @@ transcribe_status forward_buffer(Session *     cc,
         n_audio = eb.n_audio;
 
         ggml_backend_sched_reset(cc->sched);
-        if (!ggml_backend_sched_alloc_graph(cc->sched, eb.graph)) {
+        if (!TRANSCRIBE_ALLOC_SCHED_GRAPH(cc->sched, eb.graph, "voxtral_realtime")) {
             transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
                                 "voxtral_realtime run: encoder graph allocation failed — "
                                 "out of memory.");
@@ -612,7 +598,7 @@ transcribe_status forward_buffer(Session *     cc,
         apply_threads(cc->sched, cc->n_threads);
         if (ggml_backend_sched_graph_compute(cc->sched, eb.graph) != GGML_STATUS_SUCCESS) {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "voxtral_realtime run: encoder compute failed");
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_BACKEND;
         }
 
         if (dumps_on) {
@@ -732,7 +718,7 @@ transcribe_status forward_buffer(Session *     cc,
             return TRANSCRIBE_ERR_GGUF;
         }
         ggml_backend_sched_reset(cc->sched);
-        if (!ggml_backend_sched_alloc_graph(cc->sched, pb.graph)) {
+        if (!TRANSCRIBE_ALLOC_SCHED_GRAPH(cc->sched, pb.graph, "voxtral_realtime")) {
             transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
                                 "voxtral_realtime run: prefill graph allocation failed — "
                                 "out of memory.");
@@ -760,7 +746,7 @@ transcribe_status forward_buffer(Session *     cc,
         apply_threads(cc->sched, cc->n_threads);
         if (ggml_backend_sched_graph_compute(cc->sched, pb.graph) != GGML_STATUS_SUCCESS) {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "voxtral_realtime run: prefill compute failed");
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_BACKEND;
         }
         cc->kv_cache.n    = T_prompt;
         cc->kv_cache.head = T_prompt;
@@ -806,7 +792,7 @@ transcribe_status forward_buffer(Session *     cc,
                 return TRANSCRIBE_ERR_GGUF;
             }
             ggml_backend_sched_reset(cc->sched);
-            if (!ggml_backend_sched_alloc_graph(cc->sched, sb.graph)) {
+            if (!TRANSCRIBE_ALLOC_SCHED_GRAPH(cc->sched, sb.graph, "voxtral_realtime")) {
                 transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
                                     "voxtral_realtime run: step graph allocation failed — "
                                     "out of memory.");
@@ -835,7 +821,7 @@ transcribe_status forward_buffer(Session *     cc,
                                         static_cast<size_t>(max_n_kv) * sizeof(ggml_fp16_t));
                 if (ggml_backend_sched_graph_compute(cc->sched, sb.graph) != GGML_STATUS_SUCCESS) {
                     log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "voxtral_realtime run: step compute failed");
-                    return TRANSCRIBE_ERR_GGUF;
+                    return TRANSCRIBE_ERR_BACKEND;
                 }
                 int32_t tok = 0;
                 ggml_backend_tensor_get(sb.out, &tok, 0, sizeof(int32_t));
@@ -864,7 +850,7 @@ transcribe_status forward_buffer(Session *     cc,
                 return TRANSCRIBE_ERR_GGUF;
             }
             ggml_backend_sched_reset(cc->sched);
-            if (!ggml_backend_sched_alloc_graph(cc->sched, vb.graph)) {
+            if (!TRANSCRIBE_ALLOC_SCHED_GRAPH(cc->sched, vb.graph, "voxtral_realtime")) {
                 transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
                                     "voxtral_realtime run: verify graph allocation failed — "
                                     "out of memory.");
@@ -946,7 +932,7 @@ transcribe_status forward_buffer(Session *     cc,
 
                 if (ggml_backend_sched_graph_compute(cc->sched, vb.graph) != GGML_STATUS_SUCCESS) {
                     log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "voxtral_realtime run: verify compute failed");
-                    return TRANSCRIBE_ERR_GGUF;
+                    return TRANSCRIBE_ERR_BACKEND;
                 }
 
                 ggml_backend_tensor_get(vb.out, predicted.data(), 0, static_cast<size_t>(T_verify) * sizeof(int32_t));
@@ -1047,7 +1033,7 @@ transcribe_status forward_buffer(Session *     cc,
             return TRANSCRIBE_ERR_GGUF;
         }
         ggml_backend_sched_reset(cc->sched);
-        if (!ggml_backend_sched_alloc_graph(cc->sched, tf.graph)) {
+        if (!TRANSCRIBE_ALLOC_SCHED_GRAPH(cc->sched, tf.graph, "voxtral_realtime")) {
             transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
                                 "voxtral_realtime run: tail-forward graph allocation failed — "
                                 "out of memory.");
@@ -1055,7 +1041,8 @@ transcribe_status forward_buffer(Session *     cc,
         }
 
         ggml_backend_tensor_set(tf.input_ids_in, full_ids.data(), 0, full_ids.size() * sizeof(int32_t));
-        ggml_backend_tensor_set(tf.audio_in, cc->enc_host.data(), 0, cc->enc_host.size() * sizeof(float));
+        ggml_backend_tensor_set(tf.audio_in, cc->enc_host.data(), 0,
+                                static_cast<size_t>(dec_h) * n_audio * sizeof(float));
         std::vector<int32_t> positions(n_audio);
         for (int i = 0; i < n_audio; ++i) {
             positions[i] = i;
@@ -1074,7 +1061,7 @@ transcribe_status forward_buffer(Session *     cc,
         apply_threads(cc->sched, cc->n_threads);
         if (ggml_backend_sched_graph_compute(cc->sched, tf.graph) != GGML_STATUS_SUCCESS) {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "voxtral_realtime run: teacher-forced dump compute failed");
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_BACKEND;
         }
 
         auto dump = [&](const char * n, ggml_tensor * t, const char * s) {
@@ -1183,8 +1170,7 @@ transcribe_status run(transcribe_session *          session,
     }
 
     std::string text;
-    if (auto st =
-            forward_buffer(cc, cm, pcm, n_samples, cm->hparams.default_num_delay_tokens, dumps_on, k_drafts, text);
+    if (auto st = forward_buffer(cc, cm, pcm, n_samples, k_offline_num_delay_tokens, dumps_on, k_drafts, text);
         st != TRANSCRIBE_OK) {
         return st;
     }
@@ -1206,7 +1192,8 @@ transcribe_status run(transcribe_session *          session,
 // a forward over the accumulated audio yields embeddings identical to the
 // offline whole-clip forward. The incremental scheduler below (conv padding
 // cache + encoder StaticCache ring + decoder sliding-KV) is therefore numerically
-// identical to the offline path; stream_finalize matches transcribe_run.
+// identical to the offline path when both use the same delay. Streaming keeps
+// the model's low-latency default; offline inference uses delay 30.
 
 constexpr int k_default_min_decode_interval_ms = 1000;
 
@@ -1302,33 +1289,38 @@ std::string detok_generated(Model * cm, const std::vector<int32_t> & ids) {
 
 // Allocate + compute a graph on the session scheduler. Inputs are set by
 // `set_inputs` AFTER allocation (the alloc assigns tensor data pointers).
-bool stream_run_graph(Session *                     cc,
-                      Model *                       cm,
-                      ggml_cgraph *                 gf,
-                      const std::function<void()> & set_inputs,
-                      int64_t *                     out_compute_us = nullptr) {
+transcribe_status stream_run_graph(Session *                     cc,
+                                   Model *                       cm,
+                                   ggml_cgraph *                 gf,
+                                   const std::function<void()> & set_inputs,
+                                   int64_t *                     out_compute_us = nullptr) {
     if (cc->sched == nullptr) {
         cc->sched = ggml_backend_sched_new(cm->plan.scheduler_list.data(), nullptr,
                                            static_cast<int>(cm->plan.scheduler_list.size()), 16384, false, true);
         if (cc->sched == nullptr) {
-            return false;
+            return TRANSCRIBE_ERR_BACKEND;
         }
     }
     ggml_backend_sched_reset(cc->sched);
-    if (!ggml_backend_sched_alloc_graph(cc->sched, gf)) {  // graph alloc = overhead
+    if (!TRANSCRIBE_ALLOC_SCHED_GRAPH(cc->sched, gf, "voxtral_realtime")) {  // graph alloc = overhead
         transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
                             "voxtral_realtime: stream graph allocation failed — "
                             "out of memory.");
-        return false;
+        return TRANSCRIBE_ERR_OOM;
     }
     set_inputs();
     apply_threads(cc->sched, cc->n_threads);
-    const int64_t tc0 = ggml_time_us();
-    const bool    ok  = ggml_backend_sched_graph_compute(cc->sched, gf) == GGML_STATUS_SUCCESS;
+    const int64_t     tc0 = ggml_time_us();
+    const ggml_status gs  = ggml_backend_sched_graph_compute(cc->sched, gf);
     if (out_compute_us) {
         *out_compute_us = ggml_time_us() - tc0;  // pure graph_compute
     }
-    return ok;
+    if (gs != GGML_STATUS_SUCCESS) {
+        transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "voxtral_realtime: stream graph compute failed (%d)",
+                            static_cast<int>(gs));
+        return TRANSCRIBE_ERR_BACKEND;
+    }
+    return TRANSCRIBE_OK;
 }
 
 // Encoder KV ring geometry. Keep the last `sliding_window`(750) frames: hold a
@@ -1509,14 +1501,17 @@ transcribe_status stream_process(Session * cc, Model * cm, bool is_final, bool *
                         cc->mel_buf[static_cast<size_t>(k) * mel_n + (mrel + t)];
                 }
             }
-            if (!stream_run_graph(cc, cm, emb.graph, [&] {
-                    ggml_backend_tensor_set(emb.mel_in, mel_fm.data(), 0, mel_fm.size() * sizeof(float));
-                    ggml_backend_tensor_set(emb.cache1_in, cc->stream_conv0_cache.data(), 0,
-                                            cc->stream_conv0_cache.size() * sizeof(float));
-                    ggml_backend_tensor_set(emb.cache2_in, cc->stream_conv1_cache.data(), 0,
-                                            cc->stream_conv1_cache.size() * sizeof(float));
-                })) {
-                return TRANSCRIBE_ERR_GGUF;
+            if (const transcribe_status st = stream_run_graph(
+                    cc, cm, emb.graph,
+                    [&] {
+                        ggml_backend_tensor_set(emb.mel_in, mel_fm.data(), 0, mel_fm.size() * sizeof(float));
+                        ggml_backend_tensor_set(emb.cache1_in, cc->stream_conv0_cache.data(), 0,
+                                                cc->stream_conv0_cache.size() * sizeof(float));
+                        ggml_backend_tensor_set(emb.cache2_in, cc->stream_conv1_cache.data(), 0,
+                                                cc->stream_conv1_cache.size() * sizeof(float));
+                    });
+                st != TRANSCRIBE_OK) {
+                return st;
             }
             ggml_backend_tensor_get(emb.out, emb_host.data(), 0, emb_host.size() * sizeof(float));
             // Carry conv caches for the next chunk: conv0 ← last 2 NEW mel frames
@@ -1600,15 +1595,16 @@ transcribe_status stream_process(Session * cc, Model * cm, bool is_final, bool *
                 }
             }
             int64_t enc_compute_us = 0;
-            if (!stream_run_graph(
+            if (const transcribe_status st = stream_run_graph(
                     cc, cm, eb.graph,
                     [&] {
                         ggml_backend_tensor_set(eb.embed_in, chunk_in.data(), 0, chunk_in.size() * sizeof(float));
                         ggml_backend_tensor_set(eb.positions_in, pos.data(), 0, pos.size() * sizeof(int32_t));
                         ggml_backend_tensor_set(eb.mask_in, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
                     },
-                    &enc_compute_us)) {
-                return TRANSCRIBE_ERR_GGUF;
+                    &enc_compute_us);
+                st != TRANSCRIBE_OK) {
+                return st;
             }
             cc->stream_t_enc_compute_us += enc_compute_us;
 
@@ -1687,14 +1683,17 @@ transcribe_status stream_process(Session * cc, Model * cm, bool is_final, bool *
                 mask[static_cast<size_t>(r) * T_prompt + c] = mz;
             }
         }
-        if (!stream_run_graph(cc, cm, pb.graph, [&] {
-                ggml_backend_tensor_set(pb.input_ids_in, prompt_ids.data(), 0, prompt_ids.size() * sizeof(int32_t));
-                ggml_backend_tensor_set(pb.audio_in, cc->stream_audio_embeds.data(), 0,
-                                        static_cast<size_t>(dec_h) * T_prompt * sizeof(float));
-                ggml_backend_tensor_set(pb.positions_in, positions.data(), 0, positions.size() * sizeof(int32_t));
-                ggml_backend_tensor_set(pb.mask_in, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
-            })) {
-            return TRANSCRIBE_ERR_GGUF;
+        if (const transcribe_status st = stream_run_graph(
+                cc, cm, pb.graph,
+                [&] {
+                    ggml_backend_tensor_set(pb.input_ids_in, prompt_ids.data(), 0, prompt_ids.size() * sizeof(int32_t));
+                    ggml_backend_tensor_set(pb.audio_in, cc->stream_audio_embeds.data(), 0,
+                                            static_cast<size_t>(dec_h) * T_prompt * sizeof(float));
+                    ggml_backend_tensor_set(pb.positions_in, positions.data(), 0, positions.size() * sizeof(int32_t));
+                    ggml_backend_tensor_set(pb.mask_in, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
+                });
+            st != TRANSCRIBE_OK) {
+            return st;
         }
         cc->kv_cache.n    = T_prompt;
         cc->kv_cache.head = T_prompt;
@@ -1735,11 +1734,11 @@ transcribe_status stream_process(Session * cc, Model * cm, bool is_final, bool *
             cc->sched = ggml_backend_sched_new(cm->plan.scheduler_list.data(), nullptr,
                                                static_cast<int>(cm->plan.scheduler_list.size()), 16384, false, true);
             if (cc->sched == nullptr) {
-                return TRANSCRIBE_ERR_GGUF;
+                return TRANSCRIBE_ERR_BACKEND;
             }
         }
         ggml_backend_sched_reset(cc->sched);
-        if (!ggml_backend_sched_alloc_graph(cc->sched, sb.graph)) {
+        if (!TRANSCRIBE_ALLOC_SCHED_GRAPH(cc->sched, sb.graph, "voxtral_realtime")) {
             transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
                                 "voxtral_realtime: stream step graph allocation failed — "
                                 "out of memory.");
@@ -1788,7 +1787,7 @@ transcribe_status stream_process(Session * cc, Model * cm, bool is_final, bool *
             ggml_backend_tensor_set(sb.mask_in, step_mask.data(), 0,
                                     static_cast<size_t>(max_n_kv) * sizeof(ggml_fp16_t));
             if (ggml_backend_sched_graph_compute(cc->sched, sb.graph) != GGML_STATUS_SUCCESS) {
-                return TRANSCRIBE_ERR_GGUF;
+                return TRANSCRIBE_ERR_BACKEND;
             }
             if (dumps_on && cur == T_prompt - 1 + 8) {  // stream.logits_raw.gen8
                 cc->stream_gen8_logits.assign(vocab, 0.0f);
@@ -2166,7 +2165,7 @@ transcribe_status run_batch_step_loop(Session *                               cc
         ggml_backend_tensor_set(sb.mask_in, mask_buf.data(), 0, mask_buf.size() * sizeof(ggml_fp16_t));
         if (ggml_backend_sched_graph_compute(cc->sched, sb.graph) != GGML_STATUS_SUCCESS) {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "voxtral_realtime run_batch: step compute failed");
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_BACKEND;
         }
         ggml_backend_tensor_get(sb.out, out_buf.data(), 0, out_buf.size() * sizeof(int32_t));
 
@@ -2216,7 +2215,7 @@ transcribe_status run_batch(transcribe_session *          session,
     }
 
     transcribe::debug::init();
-    const int              num_delay = cm->hparams.default_num_delay_tokens;
+    const int              num_delay = k_offline_num_delay_tokens;
     const int              n_mels    = cm->hparams.enc_num_mel_bins;
     const int              dec_h     = cm->hparams.dec_hidden;
     const int              down      = cm->hparams.proj_downsample;
@@ -2273,7 +2272,7 @@ transcribe_status run_batch(transcribe_session *          session,
         cc->sched = ggml_backend_sched_new(cm->plan.scheduler_list.data(), nullptr,
                                            static_cast<int>(cm->plan.scheduler_list.size()), 16384, false, true);
         if (cc->sched == nullptr) {
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_BACKEND;
         }
     }
 
@@ -2306,7 +2305,7 @@ transcribe_status run_batch(transcribe_session *          session,
         const int n_audio_max = eb.n_audio;
 
         ggml_backend_sched_reset(cc->sched);
-        if (!ggml_backend_sched_alloc_graph(cc->sched, eb.graph)) {
+        if (!TRANSCRIBE_ALLOC_SCHED_GRAPH(cc->sched, eb.graph, "voxtral_realtime")) {
             transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
                                 "voxtral_realtime run_batch: encoder graph allocation failed — "
                                 "out of memory.");
@@ -2351,7 +2350,7 @@ transcribe_status run_batch(transcribe_session *          session,
         apply_threads(cc->sched, cc->n_threads);
         if (ggml_backend_sched_graph_compute(cc->sched, eb.graph) != GGML_STATUS_SUCCESS) {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "voxtral_realtime run_batch: encoder compute failed");
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_BACKEND;
         }
 
         std::vector<float> proj(static_cast<size_t>(dec_h) * n_audio_max * n);
@@ -2377,8 +2376,8 @@ transcribe_status run_batch(transcribe_session *          session,
     const int64_t enc_us = ggml_time_us() - t_enc0;
 
     // ----- Pass 2: ada scales (shared; num_delay uniform across the batch) -----
-    if (compute_ada_scales(cc, cm, num_delay) != TRANSCRIBE_OK) {
-        return TRANSCRIBE_ERR_GGUF;
+    if (const transcribe_status st = compute_ada_scales(cc, cm, num_delay); st != TRANSCRIBE_OK) {
+        return st;
     }
 
     // ----- Prompt (uniform) + short-clip gating -----
@@ -2483,7 +2482,7 @@ transcribe_status run_batch(transcribe_session *          session,
             return TRANSCRIBE_ERR_GGUF;
         }
         ggml_backend_sched_reset(cc->sched);
-        if (!ggml_backend_sched_alloc_graph(cc->sched, pb.graph)) {
+        if (!TRANSCRIBE_ALLOC_SCHED_GRAPH(cc->sched, pb.graph, "voxtral_realtime")) {
             transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
                                 "voxtral_realtime run_batch: prefill graph allocation failed — "
                                 "out of memory.");
@@ -2539,7 +2538,7 @@ transcribe_status run_batch(transcribe_session *          session,
         apply_threads(cc->sched, cc->n_threads);
         if (ggml_backend_sched_graph_compute(cc->sched, pb.graph) != GGML_STATUS_SUCCESS) {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "voxtral_realtime run_batch: prefill compute failed");
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_BACKEND;
         }
         std::vector<int32_t> first(n, 0);
         ggml_backend_tensor_get(pb.out, first.data(), 0, first.size() * sizeof(int32_t));
@@ -2574,7 +2573,7 @@ transcribe_status run_batch(transcribe_session *          session,
             return TRANSCRIBE_ERR_GGUF;
         }
         ggml_backend_sched_reset(cc->sched);
-        if (!ggml_backend_sched_alloc_graph(cc->sched, sb.graph)) {
+        if (!TRANSCRIBE_ALLOC_SCHED_GRAPH(cc->sched, sb.graph, "voxtral_realtime")) {
             transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
                                 "voxtral_realtime run_batch: step graph allocation failed — "
                                 "out of memory.");

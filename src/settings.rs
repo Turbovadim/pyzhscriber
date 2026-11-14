@@ -42,6 +42,34 @@ impl RouteSetting {
     }
 }
 
+/// A paid speech-to-text service. Request details live in `cloud.rs`.
+#[derive(
+    Clone, Copy, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudProvider {
+    #[default]
+    OpenAi,
+    Groq,
+    Mistral,
+    Gemini,
+    OpenRouter,
+    /// Any server exposing an OpenAI-compatible `/audio/transcriptions`.
+    Custom,
+}
+
+/// Credentials and choices for one provider. Kept per provider so switching
+/// never sends one provider's key to another. Empty fields use the
+/// provider's defaults.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct CloudAccount {
+    pub api_key: String,
+    pub model: String,
+    /// Only used by `CloudProvider::Custom`.
+    pub base_url: String,
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PasteMethod {
@@ -87,6 +115,11 @@ pub struct AppSettings {
     pub post_process_model: String,
     pub post_process_api_key: String,
     pub post_process_prompt: String,
+    /// Transcribe through `cloud_provider` instead of local models, which
+    /// still run when the cloud request fails.
+    pub cloud_enabled: bool,
+    pub cloud_provider: CloudProvider,
+    pub cloud_accounts: std::collections::BTreeMap<CloudProvider, CloudAccount>,
 }
 
 impl Default for AppSettings {
@@ -124,6 +157,9 @@ impl Default for AppSettings {
             post_process_model: String::new(),
             post_process_api_key: String::new(),
             post_process_prompt: "Clean the transcript without changing its meaning. Return only the cleaned text.\n\n${output}".into(),
+            cloud_enabled: false,
+            cloud_provider: CloudProvider::default(),
+            cloud_accounts: Default::default(),
         }
     }
 }

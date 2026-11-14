@@ -8,6 +8,7 @@
 #include "transcribe-backend.h"
 #include "transcribe-env.h"
 #include "transcribe-log.h"
+#include "transcribe-repetition-guard.h"
 #include "transcribe-session.h"
 
 #include <algorithm>
@@ -15,6 +16,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <vector>
 
 namespace transcribe::causal_lm {
@@ -36,7 +38,7 @@ ggml_tensor * rms_norm(ggml_context * ctx, ggml_tensor * x, ggml_tensor * weight
 ggml_tensor * mul_mat_f32acc(ggml_context * ctx, ggml_tensor * w, ggml_tensor * x) {
     ggml_tensor * y = ggml_mul_mat(ctx, w, x);
     if (w->type == GGML_TYPE_F16) {
-        ggml_mul_mat_set_prec(y, GGML_PREC_F32);
+        ggml_prec_set_acc(y, GGML_PREC_F32);
     }
     return y;
 }
@@ -101,6 +103,33 @@ bool kv_init(KvCache &      cache,
     cache.n       = 0;
     cache.head    = 0;
     cache.n_batch = 1;
+    return true;
+}
+
+bool kv_grow(KvCache & cache, ggml_backend_t backend, int n_ctx, int n_kv_heads, int head_dim, int n_layer) {
+    if (cache.self_k == nullptr || cache.n_batch != 1 || n_ctx <= cache.n_ctx) {
+        return false;
+    }
+    KvCache grown;
+    if (!kv_init(grown, backend, n_ctx, n_kv_heads, head_dim, n_layer, cache.self_k->type)) {
+        return false;
+    }
+    // Layout is layer-major (layer, position, head, dim), so each layer's
+    // filled rows move to a new offset; copy them layer by layer.
+    const size_t         row  = static_cast<size_t>(n_kv_heads) * head_dim * ggml_type_size(cache.self_k->type);
+    const size_t         keep = static_cast<size_t>(std::min(cache.n, cache.n_ctx)) * row;
+    std::vector<uint8_t> host(keep);
+    for (ggml_tensor * const * pair : { &cache.self_k, &cache.self_v }) {
+        ggml_tensor * dst = pair == &cache.self_k ? grown.self_k : grown.self_v;
+        for (int l = 0; l < n_layer && keep > 0; ++l) {
+            ggml_backend_tensor_get(*pair, host.data(), static_cast<size_t>(l) * cache.n_ctx * row, keep);
+            ggml_backend_tensor_set(dst, host.data(), static_cast<size_t>(l) * n_ctx * row, keep);
+        }
+    }
+    grown.n    = cache.n;
+    grown.head = cache.head;
+    cache.free();
+    cache = grown;
     return true;
 }
 
@@ -808,16 +837,142 @@ void PackedGateUpHandles::free() {
     }
 }
 
-bool pack_gate_up(ggml_backend_t                   backend,
-                  int                              hidden,
-                  int                              intermediate,
-                  const std::vector<GateUpEntry> & entries,
-                  PackedGateUpHandles &            out_handles,
-                  const char *                     error_tag) {
+namespace {
+
+// Why a block cannot alias. Reported at INFO when a load falls back, because a
+// silently lost memory win is exactly the regression this path can suffer from
+// without a wrong answer anywhere.
+enum class AliasSkip {
+    None,
+    DisabledByEnv,
+    NotInOneBuffer,
+    IsAView,
+    NotContiguous,
+    NotAdjacent,
+    SplitMapping,
+    PaddedStorage,
+};
+
+const char * alias_skip_name(AliasSkip why) {
+    switch (why) {
+        case AliasSkip::None:
+            return "aliased";
+        case AliasSkip::DisabledByEnv:
+            return "disabled by TRANSCRIBE_NO_GATE_UP_ALIAS";
+        case AliasSkip::NotInOneBuffer:
+            return "gate/up in different buffers";
+        case AliasSkip::IsAView:
+            return "gate/up is a view";
+        case AliasSkip::NotContiguous:
+            return "gate/up not contiguous";
+        case AliasSkip::NotAdjacent:
+            return "up does not follow gate";
+        case AliasSkip::SplitMapping:
+            return "mapping split into several views";
+        case AliasSkip::PaddedStorage:
+            return "padded tensor storage";
+    }
+    return "unknown";
+}
+
+// Whether a block's gate/up bytes are already in packed layout: gate_w's bytes
+// immediately followed by up_w's inside one backend buffer, so a
+// [hidden, 2*intermediate] tensor starting at gate_w->data is the fused tensor.
+//
+// That is the normal case. The converter writes `ffn.up.weight` straight after
+// `ffn.gate.weight` (verified for granite 4.0/4.1/plus, canary-qwen, qwen3-asr,
+// voxtral, voxtral-realtime, moss and funasr-nano, all quant types), and the
+// loader keeps tensors either in that same order (a copied buffer) or in place
+// (load_common's read-only mmap). Aliasing instead of copying means the packed
+// path costs no weight memory at all: under mmap the fused tensor is the very
+// pages the gate/up tensors already are.
+//
+// Deliberately conservative. Anything unexpected falls back to the copying
+// path, which is what every model got before this existed, and says why.
+AliasSkip gate_up_alias_skip(const GateUpEntry & e, size_t fused_bytes) {
+    ggml_backend_buffer_t buffer = e.gate_w->buffer;
+    if (buffer == nullptr || buffer != e.up_w->buffer) {
+        return AliasSkip::NotInOneBuffer;
+    }
+    if (e.gate_w->data == nullptr || e.up_w->data == nullptr) {
+        return AliasSkip::NotInOneBuffer;
+    }
+    if (e.gate_w->view_src != nullptr || e.up_w->view_src != nullptr) {
+        return AliasSkip::IsAView;
+    }
+    if (!ggml_is_contiguous(e.gate_w) || !ggml_is_contiguous(e.up_w)) {
+        return AliasSkip::NotContiguous;
+    }
+    if (static_cast<const char *>(e.gate_w->data) + ggml_nbytes(e.gate_w) != e.up_w->data) {
+        return AliasSkip::NotAdjacent;
+    }
+
+    // A device may keep several views of one buffer (Metal splits a mapping
+    // larger than its max buffer size into overlapping views, after rounding the
+    // length up to the page size) and a tensor has to sit inside a single one.
+    // The generic API does not expose view bounds, so only alias a buffer the
+    // device can hold as one view. Splitting rather than aliasing costs a copy;
+    // aliasing across a boundary would hand the kernel the wrong buffer, so the
+    // margin is deliberately generous.
+    constexpr size_t           k_max_page_size = 16384;  // largest page size we target
+    ggml_backend_buffer_type_t buft            = ggml_backend_buffer_get_type(buffer);
+    const size_t               max_buffer_size = ggml_backend_buft_get_max_size(buft);
+    if (max_buffer_size != 0 && ggml_backend_buffer_get_size(buffer) + k_max_page_size > max_buffer_size) {
+        return AliasSkip::SplitMapping;
+    }
+
+    // Some devices pad or reshape a tensor's storage (see load_common's mmap
+    // gating); the fused tensor is only valid if it occupies exactly its bytes.
+    if (ggml_backend_buffer_get_alloc_size(buffer, *e.gate_up_w_out) != fused_bytes) {
+        return AliasSkip::PaddedStorage;
+    }
+    return AliasSkip::None;
+}
+
+// One line per load, at INFO: the aliased count, what it saved, and - when some
+// blocks were copied - why, so a lost win is visible without a debug build.
+void log_alias_summary(const char * error_tag,
+                       size_t       n_aliased,
+                       size_t       n_entries,
+                       size_t       aliased_bytes,
+                       const size_t (&skipped)[static_cast<size_t>(AliasSkip::PaddedStorage) + 1]) {
+    std::string why;
+    if (n_aliased < n_entries) {
+        for (size_t i = 1; i <= static_cast<size_t>(AliasSkip::PaddedStorage); ++i) {
+            if (skipped[i] == 0) {
+                continue;
+            }
+            if (!why.empty()) {
+                why += ", ";
+            }
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), "%s x%zu", alias_skip_name(static_cast<AliasSkip>(i)), skipped[i]);
+            why += buf;
+        }
+    }
+
+    if (n_aliased == 0) {
+        log_msg(TRANSCRIBE_LOG_LEVEL_INFO, "%s: gate+up packed by copying (%zu blocks; %s)", error_tag, n_entries,
+                why.c_str());
+        return;
+    }
+    log_msg(TRANSCRIBE_LOG_LEVEL_INFO, "%s: gate+up aliased for %zu/%zu blocks (%.1f MiB not duplicated)%s%s",
+            error_tag, n_aliased, n_entries, static_cast<double>(aliased_bytes) / (1024.0 * 1024.0),
+            why.empty() ? "" : "; copied ", why.c_str());
+}
+
+}  // namespace
+
+transcribe_status pack_gate_up(ggml_backend_t                   backend,
+                               int                              hidden,
+                               int                              intermediate,
+                               const std::vector<GateUpEntry> & entries,
+                               PackedGateUpHandles &            out_handles,
+                               const char *                     error_tag) {
     if (backend == nullptr || hidden <= 0 || intermediate <= 0 || entries.empty()) {
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "%s: pack_gate_up invalid args (hidden=%d intermediate=%d n=%zu)",
                 error_tag, hidden, intermediate, entries.size());
-        return false;
+        return TRANSCRIBE_ERR_GGUF;
     }
 
     const size_t     ctx_size = entries.size() * ggml_tensor_overhead() + 1024;
@@ -829,7 +984,7 @@ bool pack_gate_up(ggml_backend_t                   backend,
     out_handles.ctx = ggml_init(packed_params);
     if (out_handles.ctx == nullptr) {
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "%s: pack_gate_up ggml_init failed", error_tag);
-        return false;
+        return TRANSCRIBE_ERR_OOM;
     }
 
     // One packed tensor per block, same dtype as gate_w (gate and up share
@@ -838,47 +993,97 @@ bool pack_gate_up(ggml_backend_t                   backend,
         const auto & e = entries[i];
         if (e.gate_w == nullptr || e.up_w == nullptr || e.gate_up_w_out == nullptr) {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "%s: pack_gate_up entry %zu has null member", error_tag, i);
-            return false;
+            return TRANSCRIBE_ERR_GGUF;
         }
         if (e.gate_w->type != e.up_w->type) {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "%s: pack_gate_up entry %zu gate/up type mismatch (%d vs %d)",
                     error_tag, i, static_cast<int>(e.gate_w->type), static_cast<int>(e.up_w->type));
-            return false;
+            return TRANSCRIBE_ERR_GGUF;
         }
         ggml_tensor * t = ggml_new_tensor_2d(out_handles.ctx, e.gate_w->type, hidden, 2 * intermediate);
         if (t == nullptr) {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "%s: pack_gate_up new_tensor_2d failed at %zu", error_tag, i);
-            return false;
+            return TRANSCRIBE_ERR_OOM;
+        }
+        // The fused tensor is the byte-concat of the two, so their bytes must add
+        // up to it. Each family's weights.cpp pins gate/up to
+        // [hidden, intermediate] with its own GET_LIN(...) shape check, which is
+        // what makes this true; verifying it here, before the alias/copy split,
+        // is what lets the aliased path trust the fused tensor to cover exactly
+        // those two and nothing else.
+        const size_t gate_bytes = ggml_nbytes(e.gate_w);
+        const size_t up_bytes   = ggml_nbytes(e.up_w);
+        if (ggml_nbytes(t) != gate_bytes + up_bytes) {
+            log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "%s: pack_gate_up entry %zu size mismatch (%zu vs %zu + %zu)",
+                    error_tag, i, ggml_nbytes(t), gate_bytes, up_bytes);
+            return TRANSCRIBE_ERR_GGUF;
         }
         *e.gate_up_w_out = t;
     }
 
+    // Blocks whose weights are already laid out as gate||up point at those
+    // bytes instead of duplicating them. The rest are copied into a buffer of
+    // our own, as before.
+    constexpr size_t    k_n_skip_reasons = static_cast<size_t>(AliasSkip::PaddedStorage) + 1;
+    const bool          alias_allowed    = !env::flag("TRANSCRIBE_NO_GATE_UP_ALIAS");
+    std::vector<size_t> copied;
+    size_t              n_aliased                 = 0;
+    size_t              aliased_bytes             = 0;
+    size_t              skipped[k_n_skip_reasons] = {};
+    copied.reserve(entries.size());
+
+    for (size_t i = 0; i < entries.size(); ++i) {
+        const GateUpEntry & e          = entries[i];
+        ggml_tensor *       gate_up    = *e.gate_up_w_out;
+        const size_t        fused_size = ggml_nbytes(gate_up);
+        const AliasSkip     skip       = alias_allowed ? gate_up_alias_skip(e, fused_size) : AliasSkip::DisabledByEnv;
+        if (skip != AliasSkip::None) {
+            ++skipped[static_cast<size_t>(skip)];
+            copied.push_back(i);
+            continue;
+        }
+        // Same shape, dtype and byte layout as the copied tensor; only the
+        // storage differs. gate_w->data is inside gate_w->buffer, which ggml's
+        // own bounds assert in ggml_backend_tensor_alloc checks.
+        if (ggml_backend_tensor_alloc(e.gate_w->buffer, gate_up, e.gate_w->data) != GGML_STATUS_SUCCESS) {
+            log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "%s: pack_gate_up could not alias gate/up at block %zu", error_tag, i);
+            return TRANSCRIBE_ERR_BACKEND;
+        }
+        ++n_aliased;
+        aliased_bytes += fused_size;
+    }
+
+    if (copied.empty()) {
+        log_alias_summary(error_tag, n_aliased, entries.size(), aliased_bytes, skipped);
+        return TRANSCRIBE_OK;
+    }
+
+    // alloc_ctx_tensors skips tensors that already have storage (the aliased
+    // ones) and returns NULL when none are left, hence the early return above.
     out_handles.buffer = ggml_backend_alloc_ctx_tensors(out_handles.ctx, backend);
     if (out_handles.buffer == nullptr) {
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "%s: pack_gate_up backend buffer alloc failed", error_tag);
-        return false;
+        return TRANSCRIBE_ERR_OOM;
     }
     ggml_backend_buffer_set_usage(out_handles.buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
     // Fill: concat-along-dim-1 is gate's bytes followed by up's bytes
     // (one CPU round-trip per block at load time).
     std::vector<uint8_t> buf;
-    for (const auto & e : entries) {
-        ggml_tensor * gate_up    = *e.gate_up_w_out;
-        const size_t  gate_bytes = ggml_nbytes(e.gate_w);
-        const size_t  up_bytes   = ggml_nbytes(e.up_w);
-        if (ggml_nbytes(gate_up) != gate_bytes + up_bytes) {
-            log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "%s: pack_gate_up size mismatch (%zu vs %zu + %zu)", error_tag,
-                    ggml_nbytes(gate_up), gate_bytes, up_bytes);
-            return false;
-        }
+    for (const size_t i : copied) {
+        const GateUpEntry & e          = entries[i];
+        ggml_tensor *       gate_up    = *e.gate_up_w_out;
+        const size_t        gate_bytes = ggml_nbytes(e.gate_w);
+        const size_t        up_bytes   = ggml_nbytes(e.up_w);
         buf.resize(std::max(gate_bytes, up_bytes));
         ggml_backend_tensor_get(e.gate_w, buf.data(), 0, gate_bytes);
         ggml_backend_tensor_set(gate_up, buf.data(), 0, gate_bytes);
         ggml_backend_tensor_get(e.up_w, buf.data(), 0, up_bytes);
         ggml_backend_tensor_set(gate_up, buf.data(), gate_bytes, up_bytes);
     }
-    return true;
+
+    log_alias_summary(error_tag, n_aliased, entries.size(), aliased_bytes, skipped);
+    return TRANSCRIBE_OK;
 }
 
 transcribe_status run_batched_step_loop(transcribe_session *                session,
@@ -891,7 +1096,7 @@ transcribe_status run_batched_step_loop(transcribe_session *                sess
                                         const StepBatchedState &            state,
                                         std::vector<std::vector<int32_t>> & generated,
                                         StepLoopStats *                     stats,
-                                        std::vector<char> *                 truncated_out) {
+                                        std::vector<char> *                 stop_out) {
     const int n = n_batch;
 
     // Per-row working state.
@@ -899,6 +1104,7 @@ transcribe_status run_batched_step_loop(transcribe_session *                sess
     std::vector<int>          n_past   = state.n_past;
     const std::vector<char> & valid    = state.valid;
     std::vector<char>         finished(n, 1);
+    std::vector<char>         repeating(n, 0);
     for (int b = 0; b < n; ++b) {
         if (valid[b]) {
             finished[b] = (next_tok[b] == eos_id);
@@ -944,7 +1150,7 @@ transcribe_status run_batched_step_loop(transcribe_session *                sess
         ggml_backend_tensor_set(io.mask, mask_buf.data(), 0, mask_buf.size() * sizeof(ggml_fp16_t));
 
         if (ggml_backend_sched_graph_compute(sched, io.graph) != GGML_STATUS_SUCCESS) {
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_BACKEND;
         }
         ggml_backend_tensor_get(io.argmax, out_buf.data(), 0, out_buf.size() * sizeof(int32_t));
         ++n_steps;
@@ -963,7 +1169,12 @@ transcribe_status run_batched_step_loop(transcribe_session *                sess
             if (n_past[b] < max_n_kv) {
                 mask_buf[base + n_past[b]] = mz;
             }
-            if (tok == eos_id || static_cast<int>(generated[b].size()) >= max_new || n_past[b] + 1 > max_n_kv) {
+            if (tok == eos_id) {
+                finished[b] = 1;
+            } else if (stop_on_repetition(generated[b], "batched decode")) {
+                finished[b]  = 1;
+                repeating[b] = 1;
+            } else if (static_cast<int>(generated[b].size()) >= max_new || n_past[b] + 1 > max_n_kv) {
                 finished[b] = 1;
             } else {
                 all_done = false;
@@ -976,16 +1187,25 @@ transcribe_status run_batched_step_loop(transcribe_session *                sess
         stats->step_us = ggml_time_us() - t_step0;
     }
 
-    // A valid row was truncated if it stopped for a reason OTHER than eos
-    // (generation budget or KV window). `finished` is set on every stop
-    // reason, so it can't discriminate; the signal is the last sampled token:
+    // A valid row was cut off if it stopped for a reason OTHER than eos
+    // (generation budget, KV window, repetition guard). `finished` is set on
+    // every stop reason, so it can't discriminate; the signal is the last sampled token:
     // `next_tok[b] != eos_id` means the row was cut off mid-transcript (it is
     // frozen once the row finishes). See docs/input-limits.md.
-    if (truncated_out != nullptr) {
-        truncated_out->assign(n, 0);
-        for (int b = 0; b < n; ++b) {
-            (*truncated_out)[b] = (valid[b] && next_tok[b] != eos_id) ? 1 : 0;
+    std::vector<char> stop(n, k_stop_eos);
+    for (int b = 0; b < n; ++b) {
+        if (!valid[b] || next_tok[b] == eos_id) {
+            continue;
         }
+        if (repeating[b]) {
+            stop[b] = k_stop_repetition;
+        } else {
+            stop[b] = k_stop_budget;
+            trim_repetition_at_budget_stop(generated[b], "batched decode");
+        }
+    }
+    if (stop_out != nullptr) {
+        *stop_out = std::move(stop);
     }
     return TRANSCRIBE_OK;
 }

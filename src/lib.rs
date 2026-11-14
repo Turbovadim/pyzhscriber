@@ -2,12 +2,16 @@ mod app;
 mod assets;
 mod audio;
 mod cli;
+mod cli_install;
+mod cloud;
 mod controller;
 mod dialogs;
 mod history;
 mod hotkey;
+mod ipc;
 mod logging;
 mod models;
+mod opus_audio;
 mod output;
 mod permissions;
 mod post_process;
@@ -83,6 +87,21 @@ pub fn render_visual_qa(output: &std::path::Path) -> anyhow::Result<()> {
     cx.run_until_parked();
     cx.capture_screenshot(window.into())?
         .save(output.join("models-filtered.png"))?;
+
+    // Cloud sits below the fold, so it gets a window tall enough to show it.
+    let tall = cx.open_window(gpui::size(gpui::px(960.0), gpui::px(1500.0)), {
+        let controller = controller.clone();
+        move |_, cx| cx.new(|cx| ui::RootView::new(controller, cx))
+    })?;
+    tall.update(&mut cx, |view, _, cx| view.prepare_qa_cloud(cx))?;
+    cx.run_until_parked();
+    cx.capture_screenshot(tall.into())?
+        .save(output.join("general-cloud.png"))?;
+
+    window.update(&mut cx, |view, _, cx| view.prepare_qa_error(cx))?;
+    cx.run_until_parked();
+    cx.capture_screenshot(window.into())?
+        .save(output.join("error.png"))?;
 
     window.update(&mut cx, |view, _, cx| view.prepare_qa_permissions(cx))?;
     cx.run_until_parked();

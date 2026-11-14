@@ -388,7 +388,7 @@ transcribe_status run_multitalker(ParakeetSession *             pc,
                                            /*graph_size=*/8192, /*parallel=*/false, /*op_offload=*/true);
         if (pc->sched == nullptr) {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "parakeet multitalker: ggml_backend_sched_new failed");
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_BACKEND;
         }
     }
 
@@ -651,7 +651,7 @@ transcribe_status run_multitalker(ParakeetSession *             pc,
 
     // Transcript-independent "who spoke when" rows from the diarizer preds
     // (same emission as the standalone sortformer family).
-    sf::probs_to_speaker_segments(pc, probs, T_diar, n_spk, diar_ms_per_frame, /*threshold=*/0.5f);
+    transcribe::probs_to_segments(probs.data(), T_diar, n_spk, diar_ms_per_frame, pc->speaker_segments);
 
     // ---- Elide to the caller's requested granularity (same convention
     // as decode_and_populate). ----

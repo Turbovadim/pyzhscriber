@@ -39,6 +39,11 @@ install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/include/transcribe"
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
     FILES_MATCHING PATTERN "*.h")
 
+# --- translated probability policy attribution -------------------------------
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/silero_vad/LICENSE"
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/transcribe
+    RENAME LICENSE.silero_vad)
+
 # --- libtranscribe ------------------------------------------------------------
 # ggml's own install rules cover ggml / ggml-base. They ALSO declare an install
 # for each backend module, but ggml_add_backend_library() uses `LIBRARY
@@ -135,7 +140,18 @@ if(NOT TRANSCRIBE_BUILD_SHARED)
         list(APPEND _frameworks Accelerate)
     endif()
     if("vulkan" IN_LIST _kinds)
-        list(APPEND _system_libs vulkan)
+        # The Vulkan import library's basename is platform-specific: Windows'
+        # LunarG SDK ships `vulkan-1.lib` (the import lib for the
+        # driver-installed vulkan-1.dll loader); every other platform links
+        # `libvulkan`. Emit the right name per-OS so a non-CMake consumer
+        # reconstructing the link line from this manifest resolves it — a bare
+        # `vulkan` becomes `vulkan.lib` on MSVC, which the SDK does not provide,
+        # so the link dies with LNK1181.
+        if(WIN32)
+            list(APPEND _system_libs vulkan-1)
+        else()
+            list(APPEND _system_libs vulkan)
+        endif()
     endif()
     if("rocm" IN_LIST _kinds)
         # ggml-hip is an archive in this posture, but its HIP/rocBLAS/hipBLAS

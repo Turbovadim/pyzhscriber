@@ -42,6 +42,8 @@ namespace {
 
 namespace conf = transcribe::conformer;
 
+constexpr int kWindowedChunkMinWindowCount = 12;
+
 // ----- Per-family depthwise dispatch policy -----
 //
 // In-block depthwise conv uses the direct conv_2d_dw path on every
@@ -323,16 +325,21 @@ EncoderBuild build_encoder_graph(ggml_context *                     ctx,
     if (n_batch < 1) {
         n_batch = 1;
     }
-    const bool       var_len_masks = batch_var_len && n_batch > 1;
+    const bool       var_len_masks = batch_var_len && (n_batch > 1 || hp.kestrel_length_masking);
     conf::ConvPolicy policy{};
-    policy.direct_pw               = conf::detect_direct_pw(backend_name);
-    policy.direct_dw_in_block      = detect_direct_dw_in_block(backend_name);
-    policy.direct_dw_in_pre_encode = detect_direct_dw_in_pre_encode(backend_name);
+    // A 1x1 pointwise conv cannot mix time frames, so masking after its
+    // ReLU also implements Transformers' mask-after-every-conv semantics.
+    policy.pre_encode_mask_after_stride = hp.kestrel_length_masking && !hp.mask_after_pointwise;
+    policy.pre_encode_f32_pointwise     = hp.kestrel_length_masking;
+    policy.direct_pw                    = conf::detect_direct_pw(backend_name);
+    policy.direct_conv0_in_pre_encode   = true;
+    policy.direct_dw_in_block           = detect_direct_dw_in_block(backend_name);
+    policy.direct_dw_in_pre_encode      = detect_direct_dw_in_pre_encode(backend_name);
     // Cache-aware streaming (NeMo causal_downsampling=true) uses
     // CausalConv2D for the pre-encode subsample (left=k-1, right=stride-1).
     // Inferred from the attention style — only ChunkedLimited is causal.
     // Independent of the conformer conv-module's conv_context.
-    policy.causal_pre_encode       = (hp.enc_att_context_style == ParakeetHParams::AttContextStyle::ChunkedLimited);
+    policy.causal_pre_encode = (hp.enc_att_context_style == ParakeetHParams::AttContextStyle::ChunkedLimited);
 
     EncoderBuild eb{};
 
@@ -384,9 +391,11 @@ EncoderBuild build_encoder_graph(ggml_context *                     ctx,
                                              /*name_prefix=*/"enc.pre_encode",
                                              /*error_tag=*/"parakeet", mask_pre_encode ? &pe_masks : nullptr);
     if (mask_pre_encode) {
-        eb.pre_encode_mask_s1_in = pe_masks.mask_s1;
-        eb.pre_encode_mask_s2_in = pe_masks.mask_s2;
-        eb.pre_encode_mask_s3_in = pe_masks.mask_s3;
+        eb.pre_encode_mask_s1_in   = pe_masks.mask_s1;
+        eb.pre_encode_mask_s2_in   = pe_masks.mask_s2;
+        eb.pre_encode_mask_s3_in   = pe_masks.mask_s3;
+        eb.pre_encode_extent_s2_in = pe_masks.mask_s2_extent;
+        eb.pre_encode_extent_s3_in = pe_masks.mask_s3_extent;
     }
     if (x == nullptr) {
         // build_pre_encode already logged the diagnostic.
@@ -459,26 +468,86 @@ EncoderBuild build_encoder_graph(ggml_context *                     ctx,
         // pos_emb input, ne = [d_model, pos_len, 1, 1] (numpy
         // (pos_len, d_model)), filled by the driver. Local attention
         // (Regular, both contexts >= 0) shortens pos_len to (left+right+1)
-        // (NeMo LocalAttRelPositionalEncoding); ChunkedLimited keeps the
-        // full 2T-1 and uses a separate mask. ChunkedLimitedWithRc engages
-        // the mask only when buf_mask is non-null (offline runs full attn).
+        // (NeMo LocalAttRelPositionalEncoding). Long ChunkedLimited and
+        // Regular-local runs, batched or not, use the exact bounded
+        // query/key geometry; shorter runs retain the dense reference
+        // graph. ChunkedLimitedWithRc engages its dense mask only when
+        // buf_mask is non-null (offline runs full attention).
         const bool is_chunked =
             (hp.enc_att_context_style == ParakeetHParams::AttContextStyle::ChunkedLimited) ||
             (hp.enc_att_context_style == ParakeetHParams::AttContextStyle::ChunkedLimitedWithRc && buf_mask != nullptr);
-        const bool    is_local_pe = (!is_chunked) && (hp.enc_att_context_left >= 0 && hp.enc_att_context_right >= 0);
-        const int64_t pos_len     = is_local_pe ?
-                                        static_cast<int64_t>(hp.enc_att_context_left + hp.enc_att_context_right + 1) :
-                                        (2 * T_enc - 1);
-        eb.pos_emb_in             = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hp.enc_d_model, pos_len);
+        // A Regular-local band that already covers every (q, k) pair is full
+        // attention: run the full-attention graph (bit-identical to a -1/-1
+        // checkpoint) instead of a 2L+1-row pos table that is sliced back.
+        const bool band_covers_all = (!is_chunked) && hp.enc_att_context_left >= 0 && hp.enc_att_context_right >= 0 &&
+                                     T_enc - 1 <= std::min(hp.enc_att_context_left, hp.enc_att_context_right);
+        eb.full_attention_shortcut = band_covers_all;
+        const bool is_local_hp =
+            !band_covers_all && (!is_chunked) && (hp.enc_att_context_left >= 0 && hp.enc_att_context_right >= 0);
+        // Bounded-window geometry (query block C, keys W starting at
+        // n*C - left). ChunkedLimited: C = chunk, left = left_chunks*C.
+        // Regular-local [L, R]: C is a power of two near (L+R+1)/4, which
+        // bounds the masked-out work per block at ~25% while replicating
+        // K/V about five times.
+        int win_chunk = 0;
+        int win_left  = 0;
+        int win_keys  = 0;
+        if (hp.enc_att_context_style == ParakeetHParams::AttContextStyle::ChunkedLimited &&
+            hp.enc_att_context_right >= 0 && hp.enc_att_context_left >= 0) {
+            win_chunk = hp.enc_att_context_right + 1;
+            win_left  = (hp.enc_att_context_left / win_chunk) * win_chunk;
+            win_keys  = win_left + win_chunk;
+        } else if (is_local_hp && hp.enc_att_context_right <= hp.enc_att_context_left) {
+            // The K/V windows come from a symmetric left-padded im2col, which
+            // only yields every block's window when right <= left. Wider
+            // right contexts (reachable only via the validation override;
+            // no shipped checkpoint has one) stay on the dense local graph.
+            const int span = hp.enc_att_context_left + hp.enc_att_context_right + 1;
+            win_chunk      = 16;
+            while (win_chunk * 8 < span && win_chunk < 256) {
+                win_chunk *= 2;
+            }
+            win_left = hp.enc_att_context_left;
+            win_keys = hp.enc_att_context_left + win_chunk + hp.enc_att_context_right;
+        }
+        // Window materialization has a fixed reshape/im2col cost. For the
+        // chunked streaming models keep the dense graph below the measured
+        // crossover so short requests do not regress. The dense Regular-local
+        // graph pads its scores to the full [2T-1, T, H] shape (24 GB of
+        // scratch at 305 s), so it only stays dense while the band still
+        // covers most of the sequence.
+        const int64_t min_windows = is_local_hp ? 1 : kWindowedChunkMinWindowCount;
+        const bool    windowed    = win_chunk > 0 && T_enc > min_windows * static_cast<int64_t>(win_keys);
+        if (!windowed) {
+            win_chunk = win_left = win_keys = 0;
+        }
+        eb.window_chunk           = win_chunk;
+        eb.window_left            = win_left;
+        eb.window_keys            = win_keys;
+        // Dense Regular-local keeps NeMo's (left+right+1) pos table and the
+        // in-graph band padding; the windowed graph carries its own band.
+        const bool    is_local_pe = is_local_hp && !windowed;
+        const int64_t pos_len =
+            windowed    ? static_cast<int64_t>(win_keys + win_chunk - 1) :
+            is_local_pe ? static_cast<int64_t>(hp.enc_att_context_left + hp.enc_att_context_right + 1) :
+                          (2 * T_enc - 1);
+        eb.pos_emb_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hp.enc_d_model, pos_len);
         ggml_set_name(eb.pos_emb_in, "pos_emb.in");
         ggml_set_input(eb.pos_emb_in);
 
-        // ChunkedLimited mask. [T_enc, T_enc, 1, 1] F32; the driver
-        // fills it host-side after the compute buffer is allocated.
-        // Broadcasts across heads inside rel_pos_mhsa.
+        // Attention mask. The dense ChunkedLimited graph uses
+        // [T_enc,T_enc,1,1]. The bounded graph (chunked or local) uses
+        // [win_keys,win_chunk,1,n_chunks*n_batch], one slab per utterance,
+        // and carries the band, the sequence edges and each utterance's
+        // padded tail; the driver fills it host-side.
         ggml_tensor * chunked_mask_in = nullptr;
-        if (is_chunked) {
-            chunked_mask_in = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, T_enc, T_enc, 1, 1);
+        if (is_chunked || windowed) {
+            if (windowed) {
+                const int64_t n_chunks = (T_enc + win_chunk - 1) / win_chunk;
+                chunked_mask_in = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, win_keys, win_chunk, 1, n_chunks * n_batch);
+            } else {
+                chunked_mask_in = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, T_enc, T_enc, 1, 1);
+            }
             ggml_set_name(chunked_mask_in, "attn.chunked_mask.in");
             ggml_set_input(chunked_mask_in);
             eb.chunked_mask_in = chunked_mask_in;
@@ -497,6 +566,8 @@ EncoderBuild build_encoder_graph(ggml_context *                     ctx,
         // each utterance's padded tail from corrupting its real frames:
         //   - attn_pad_mask_in [T_enc, 1, 1, n_batch]: additive (-INF on
         //     padded keys) so real queries never attend to padded keys.
+        //     The bounded-window graph has no [T, T] scores to add it to;
+        //     its per-utterance window mask masks the padded tail instead.
         //   - conv_pad_mask_in [T_enc, 1, n_batch, 1]: 0/1 valid-frame mask
         //     that zeroes padded frames after pw1+GLU and before the
         //     depthwise conv (same role as the buffered-streaming mask, but
@@ -504,10 +575,12 @@ EncoderBuild build_encoder_graph(ggml_context *                     ctx,
         //     buffered path is mutually exclusive with offline batching.
         ggml_tensor * attn_pad_mask_in = nullptr;
         if (var_len_masks) {
-            attn_pad_mask_in = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, T_enc, 1, 1, n_batch);
-            ggml_set_name(attn_pad_mask_in, "attn.pad_mask.in");
-            ggml_set_input(attn_pad_mask_in);
-            eb.attn_pad_mask_in = attn_pad_mask_in;
+            if (!windowed) {
+                attn_pad_mask_in = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, T_enc, 1, 1, n_batch);
+                ggml_set_name(attn_pad_mask_in, "attn.pad_mask.in");
+                ggml_set_input(attn_pad_mask_in);
+                eb.attn_pad_mask_in = attn_pad_mask_in;
+            }
 
             conv_pad_mask_in = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, T_enc, 1, n_batch, 1);
             ggml_set_name(conv_pad_mask_in, "conv.pad_mask.batch.in");
@@ -527,10 +600,13 @@ EncoderBuild build_encoder_graph(ggml_context *                     ctx,
         transcribe::flash::apply_env_overrides(enc_use_flash, dec_use_flash);
         bparams.use_flash          = enc_use_flash;
         bparams.policy             = policy;
-        bparams.att_context_left   = hp.enc_att_context_left;
-        bparams.att_context_right  = hp.enc_att_context_right;
+        bparams.att_context_left   = band_covers_all ? -1 : hp.enc_att_context_left;
+        bparams.att_context_right  = band_covers_all ? -1 : hp.enc_att_context_right;
         bparams.att_context_style  = is_chunked ? conf::BlockParams::AttContextStyle::ChunkedLimited :
                                                   conf::BlockParams::AttContextStyle::Regular;
+        bparams.window_chunk       = win_chunk;
+        bparams.window_left        = win_left;
+        bparams.window_keys        = win_keys;
         bparams.attn_chunked_mask  = chunked_mask_in;
         bparams.attn_pad_mask      = attn_pad_mask_in;
         bparams.conv_context_left  = hp.enc_conv_context_left;
@@ -702,11 +778,12 @@ EncoderBuild build_encoder_graph_streaming(ggml_context *            ctx,
                                            const char *              backend_name,
                                            bool                      spk_supervision) {
     conf::ConvPolicy policy{};
-    policy.direct_pw               = conf::detect_direct_pw(backend_name);
-    policy.direct_dw_in_block      = detect_direct_dw_in_block(backend_name);
-    policy.direct_dw_in_pre_encode = detect_direct_dw_in_pre_encode(backend_name);
+    policy.direct_pw                  = conf::detect_direct_pw(backend_name);
+    policy.direct_conv0_in_pre_encode = true;
+    policy.direct_dw_in_block         = detect_direct_dw_in_block(backend_name);
+    policy.direct_dw_in_pre_encode    = detect_direct_dw_in_pre_encode(backend_name);
     // Causal pre-encode is the cache-aware streaming convention only.
-    policy.causal_pre_encode       = (hp.enc_att_context_style == ParakeetHParams::AttContextStyle::ChunkedLimited);
+    policy.causal_pre_encode          = (hp.enc_att_context_style == ParakeetHParams::AttContextStyle::ChunkedLimited);
 
     EncoderBuild eb{};
 
@@ -978,6 +1055,79 @@ EncoderBuild build_encoder_graph_streaming(ggml_context *            ctx,
         ggml_build_forward_expand(eb.graph, eb.dumps.final_out);
     }
     return eb;
+}
+
+VadBuild build_vad_graph(ggml_context *          ctx,
+                         const ParakeetWeights & w,
+                         const ParakeetHParams & hp,
+                         int                     n_mel_frames,
+                         const char *            backend_name) {
+    VadBuild vb{};
+    if (ctx == nullptr || n_mel_frames <= 0 || !hp.has_vad_head || w.vad.proj_w == nullptr) {
+        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "parakeet vad: invalid arg (no vad head or empty mel)");
+        return vb;
+    }
+    // Same subsampler policy as build_encoder_graph on this model, so the
+    // head sees exactly the pre_encode output the encoder would.
+    conf::ConvPolicy policy{};
+    policy.direct_pw                    = conf::detect_direct_pw(backend_name);
+    policy.direct_conv0_in_pre_encode   = true;
+    policy.direct_dw_in_block           = detect_direct_dw_in_block(backend_name);
+    policy.direct_dw_in_pre_encode      = detect_direct_dw_in_pre_encode(backend_name);
+    policy.causal_pre_encode            = false;
+    policy.pre_encode_mask_after_stride = hp.kestrel_length_masking && !hp.mask_after_pointwise;
+    policy.pre_encode_f32_pointwise     = hp.kestrel_length_masking;
+
+    vb.mel_in = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_mel_frames, hp.fe_num_mels, 1, 1);
+    ggml_set_name(vb.mel_in, "vad.mel.in");
+    ggml_set_input(vb.mel_in);
+
+    conf::PreEncodeValidMasks pe_masks;
+    ggml_tensor *             x =
+        conf::build_pre_encode(ctx, to_view(w.pre_encode), vb.mel_in, policy, /*name_prefix=*/"vad.pre_encode",
+                               /*error_tag=*/"parakeet vad", hp.kestrel_length_masking ? &pe_masks : nullptr);
+    if (x == nullptr) {
+        return vb;
+    }
+    vb.pe_mask_s1_in   = pe_masks.mask_s1;
+    vb.pe_mask_s2_in   = pe_masks.mask_s2;
+    vb.pe_mask_s3_in   = pe_masks.mask_s3;
+    vb.pe_extent_s2_in = pe_masks.mask_s2_extent;
+    vb.pe_extent_s3_in = pe_masks.mask_s3_extent;
+    vb.pre_encode_out  = x;  // [d_model, T]
+
+    const int64_t d_model = x->ne[0];
+    const int64_t H       = hp.vad_hidden;
+    const int     K       = hp.vad_context_kernel;
+
+    // proj: Conv1d(d_model -> H, k=1) == mul_mat over channels. [1, d, H] -> [d, H].
+    ggml_tensor * h = ggml_mul_mat(ctx, ggml_reshape_2d(ctx, w.vad.proj_w, d_model, H), x);  // [H, T]
+    h               = ggml_add(ctx, h, w.vad.proj_b);
+    h               = ggml_silu(ctx, h);
+    vb.proj_out     = conf::named(h, "vad.proj");
+
+    // conv_1d_f32 takes [T, IC] data and returns [T, OC].
+    ggml_tensor * t = ggml_cont(ctx, ggml_transpose(ctx, h));                                     // [T, H]
+    t = conf::conv_1d_f32(ctx, w.vad.ctx_w, t, /*stride=*/1, /*padding=*/K / 2, /*dilation=*/1);  // [T, H]
+    t = ggml_add(ctx, t, ggml_reshape_2d(ctx, w.vad.ctx_b, 1, H));
+    t = ggml_silu(ctx, t);
+    ggml_tensor * c = ggml_cont(ctx, ggml_transpose(ctx, t));  // [H, T]
+    vb.ctx_out      = conf::named(c, "vad.ctx");
+
+    ggml_tensor * o = ggml_mul_mat(ctx, ggml_reshape_2d(ctx, w.vad.out_w, H, 1), c);  // [1, T]
+    o               = ggml_add(ctx, o, w.vad.out_b);
+    vb.prob         = conf::named(ggml_sigmoid(ctx, o), "vad.prob");
+
+    vb.graph = ggml_new_graph_custom(ctx, /*size=*/1024, /*grads=*/false);
+    if (vb.graph == nullptr) {
+        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "parakeet vad: ggml_new_graph_custom failed");
+        return vb;
+    }
+    ggml_build_forward_expand(vb.graph, vb.prob);
+    for (ggml_tensor * keep : { vb.pre_encode_out, vb.proj_out, vb.ctx_out }) {
+        transcribe::debug::mark_tensor_for_dump(keep);
+    }
+    return vb;
 }
 
 }  // namespace transcribe::parakeet

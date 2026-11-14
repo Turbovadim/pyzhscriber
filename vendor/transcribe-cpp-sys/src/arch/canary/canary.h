@@ -9,11 +9,11 @@
 #include "ggml-backend.h"
 #include "ggml.h"
 #include "transcribe-backend.h"
+#include "transcribe-load-common.h"
 #include "transcribe-mel.h"
 #include "transcribe-model.h"
 #include "transcribe-session.h"
 #include "transcribe-tokenizer.h"
-#include "transcribe-weights-mmap.h"
 #include "weights.h"
 
 #include <cstdint>
@@ -104,9 +104,8 @@ struct CanaryModel final : public transcribe_model {
     CanaryWeights  weights;
     ggml_context * ctx_meta = nullptr;
 
-    transcribe::BackendPlan plan;
-    ggml_backend_buffer_t   backend_buffer = nullptr;
-    std::unique_ptr<load_common::WeightMapping> weight_mapping;
+    transcribe::BackendPlan                plan;
+    transcribe::load_common::WeightStorage weight_storage;
 
     // Fused BN parameters (same as parakeet/cohere).
     ggml_context *        bn_fused_ctx    = nullptr;
@@ -125,9 +124,7 @@ struct CanaryModel final : public transcribe_model {
 };
 
 struct CanarySession final : public transcribe_session {
-    ggml_context *       compute_ctx = nullptr;
-    ggml_backend_sched_t sched       = nullptr;
-    ggml_tensor *        encoder_out = nullptr;
+    ggml_tensor * encoder_out = nullptr;
 
     CanaryKvCache kv_cache;
 
@@ -144,6 +141,7 @@ struct CanarySession final : public transcribe_session {
 
     CanarySession() = default;
     ~CanarySession() override;
+    void on_scratch_released() noexcept override;
 };
 
 }  // namespace transcribe::canary

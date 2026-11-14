@@ -10,6 +10,7 @@
 #include "../sortformer/sortformer.h"  // embedded diarizer (multitalker bundle)
 #include "decoder.h"
 #include "transcribe-backend.h"
+#include "transcribe-load-common.h"
 #include "transcribe-mel.h"
 #include "transcribe-model.h"
 #include "transcribe-session.h"
@@ -23,6 +24,7 @@
 #include <vector>
 
 struct ggml_context;
+struct ggml_cgraph;
 struct ggml_tensor;
 struct ggml_backend;
 struct ggml_backend_buffer;
@@ -38,7 +40,7 @@ inline int pre_encode_time_out(int input_frames, bool causal) {
     return causal ? (input_frames / 2 + 1) : ((input_frames - 1) / 2 + 1);
 }
 
-// Host-side attention-mask helpers for the streaming paths. Declared
+// Host-side attention-mask helpers for the chunked-attention paths. Declared
 // here so the per-mask unit tests can call them without a ggml backend
 // or a GGUF on disk.
 //
@@ -64,6 +66,25 @@ void compute_chunked_limited_with_rc_mask(float * out_buf,
                                           int     right_context_frames,
                                           int     pad_length);
 
+// Bounded offline ChunkedLimited mask. The dense mask has T*T cells, but
+// every query chunk only attends to `left_chunks` complete chunks on its
+// left plus itself. This helper emits the equivalent compact layout used by
+// rel_pos_mhsa: [window, chunk_size, 1, n_chunks], contiguous in `window`,
+// where window = (left_chunks + 1)*chunk_size and
+// n_chunks = ceil(T_alloc/chunk_size). T is the utterance's valid length and
+// T_alloc >= T the graph's padded length (the batch T_max; T itself when
+// unpadded): keys and queries at or past T are the utterance's padded tail
+// and are -INF. Padded query rows retain one finite cell to avoid an
+// all-masked softmax; those rows never reach the residual path.
+void compute_chunked_limited_window_mask(float * out_buf, int T, int T_alloc, int chunk_size, int left_chunks);
+
+// Bounded Regular-local mask (NeMo rel_pos_local_attn / att_context
+// [left, right]): query q attends to keys k with q - left <= k <= q + right.
+// Same compact layout and T / T_alloc contract as above with
+// window = left + chunk_size + right and block n's keys starting at
+// n*chunk_size - left.
+void compute_local_window_mask(float * out_buf, int T, int T_alloc, int chunk_size, int left, int right);
+
 // Family defaults — applied before transcribe::read_capability_kv runs
 // (KV present overrides, KV absent leaves the default). Defined in
 // capabilities.cpp. There is no per-variant resolver: variant identity
@@ -84,8 +105,8 @@ struct ParakeetModel final : public transcribe_model {
     // load_common::init_backends (see transcribe-backend.h). plan's
     // scheduler_list owns the backends; the destructor frees them in
     // reverse order.
-    transcribe::BackendPlan plan;
-    ggml_backend_buffer_t   backend_buffer = nullptr;
+    transcribe::BackendPlan                plan;
+    transcribe::load_common::WeightStorage weight_storage;
 
     // Fused BN parameters live in a separate ggml context + buffer,
     // computed at load time from the raw BN tensors. Freed in dtor.
@@ -233,18 +254,60 @@ struct ParakeetStreamingDecoderState {
     bool initialized = false;
 };
 
-// Concrete context. Owns a per-call compute context and a persistent
-// multi-backend scheduler that dispatches encoder graph ops to the best
-// available backend.
+// Scheduler-allocated steady-state streaming graph. ggml graphs are
+// multi-use for computation once allocated; retaining the fixed-geometry
+// graph avoids rebuilding and re-allocating the same encoder topology for
+// every chunk. All tensor handles are borrowed from compute_ctx and become
+// invalid together when reset() is called before that context is freed.
+struct ParakeetStreamingGraph {
+    ggml_cgraph * graph = nullptr;
+
+    ggml_tensor * mel_in            = nullptr;
+    ggml_tensor * pos_emb_in        = nullptr;
+    ggml_tensor * chunked_mask_in   = nullptr;
+    ggml_tensor * prompt_one_hot_in = nullptr;
+    ggml_tensor * spk_mask_in       = nullptr;
+    ggml_tensor * bg_mask_in        = nullptr;
+    ggml_tensor * out               = nullptr;
+
+    std::vector<ggml_tensor *> channel_out;
+    std::vector<ggml_tensor *> time_out;
+    std::vector<ggml_tensor *> k_out;
+    std::vector<ggml_tensor *> v_out;
+
+    int  n_mel_chunk_frames     = -1;
+    int  drop_extra_pre_encoded = -1;
+    int  pos_proj_len           = -1;
+    int  kv_type                = -1;
+    bool spk_supervision        = false;
+    bool ready                  = false;
+
+    void reset() {
+        graph                  = nullptr;
+        mel_in                 = nullptr;
+        pos_emb_in             = nullptr;
+        chunked_mask_in        = nullptr;
+        prompt_one_hot_in      = nullptr;
+        spk_mask_in            = nullptr;
+        bg_mask_in             = nullptr;
+        out                    = nullptr;
+        n_mel_chunk_frames     = -1;
+        drop_extra_pre_encoded = -1;
+        pos_proj_len           = -1;
+        kv_type                = -1;
+        spk_supervision        = false;
+        ready                  = false;
+        channel_out.clear();
+        time_out.clear();
+        k_out.clear();
+        v_out.clear();
+    }
+};
+
+// Concrete context. The per-call compute context and the multi-backend
+// scheduler that dispatches encoder graph ops to the best available backend
+// are owned by the transcribe_session base (sched / compute_ctx).
 struct ParakeetSession final : public transcribe_session {
-    // Compute context: cgraph + intermediate tensor metadata. no_alloc;
-    // data lives in sched-managed buffers. Reset each run().
-    ggml_context * compute_ctx = nullptr;
-
-    // Multi-backend scheduler. Persists across calls; manages compute
-    // buffer allocation and reuses buffers when topology is unchanged.
-    ggml_backend_sched_t sched = nullptr;
-
     // Encoder forward output, borrowed into compute_ctx; invalidated when
     // compute_ctx is reset next run().
     ggml_tensor * encoder_out = nullptr;
@@ -272,6 +335,8 @@ struct ParakeetSession final : public transcribe_session {
     // clear_result (the family owns its per-utterance audio scratch).
     std::vector<float>    stream_pcm_buffer;
     transcribe_run_params stream_run_params{};
+    // Convert from cumulative samples so odd feed sizes do not lose fractions.
+    int64_t               stream_audio_input_samples = 0;
 
     // ---- incremental streaming state (cache-aware) ----
     //
@@ -280,18 +345,16 @@ struct ParakeetSession final : public transcribe_session {
     // an utterance, freed in the dtor.
     ParakeetStreamingCaches       stream_caches;
     ParakeetStreamingDecoderState stream_dec_state;
+    ParakeetStreamingGraph        stream_graph;
 
     // ---- Buffered streaming state (parakeet-unified-en-0.6b) ----
     //
     // Mirrors NeMo's StreamingBatchedAudioBuffer + reference inference
     // loop. Variable-stride: step 0 consumes samples_chunk + samples_right
-    // of new audio; subsequent feeds consume samples_chunk; finalize's
-    // last step consumes the rest (chunk slot absorbs the trailing right
-    // context, no zero-pad). The buf_* geometry reflects the active
-    // (L, C, R) tuple; the ctx_* fields track the buffer's internal
-    // ContextSize, updated per-chunk via buf_ctx_add_frames (NeMo's
-    // add_frames_get_removed_). The RNN-T state rides on stream_dec_state
-    // (same predictor/joint path, no per-layer encoder cache).
+    // of new audio; subsequent feeds consume samples_chunk. Finalize folds
+    // retained right context into the decoded chunk and appends right-context
+    // silence without advancing the real-audio cursor. The RNN-T state rides
+    // on stream_dec_state (same predictor/joint path, no per-layer encoder cache).
     int32_t buf_left_frames     = 0;  // L (expected)
     int32_t buf_chunk_frames    = 0;  // C
     int32_t buf_right_frames    = 0;  // R
@@ -317,6 +380,7 @@ struct ParakeetSession final : public transcribe_session {
 
     ParakeetSession() = default;
     ~ParakeetSession() override;
+    void on_scratch_released() noexcept override;
 };
 
 // ---- Multitalker (bundle) internals ----------------------------------- //

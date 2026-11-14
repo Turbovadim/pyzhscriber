@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-labelledby="title">
+<title id="title">Pyzhscriber: Signal key</title>
+<rect x="8" y="8" width="240" height="240" rx="54" fill="#000"/>
+<rect x="37" y="43" width="182" height="176" rx="39" fill="#425F1D"/>
+<path d="M40 84c0-25 13-39 38-39h100c25 0 38 14 38 39v91c0 24-13 35-38 35H78c-25 0-38-11-38-35z" fill="#7CAD30"/>
+<rect x="44" y="35" width="168" height="164" rx="34" fill="#C2F264"/>
+<path d="M65 44h122" stroke="#E6FFAA" stroke-width="3" stroke-linecap="round"/>
+<rect x="67" y="62" width="122" height="85" rx="18" fill="#25371B"/>
+<path d="M81 105h11l9-20 14 44 14-48 12 30h33" fill="none" stroke="#CDFC79" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+<rect x="77" y="164" width="29" height="11" rx="5.5" fill="#81A93D"/>
+<circle cx="169" cy="169" r="7" fill="#25371B"/>
+<circle cx="169" cy="169" r="3" fill="#E4FFAF"/>
+<path d="M120 170h22" stroke="#668B2A" stroke-width="5" stroke-linecap="round"/>
+</svg>
+

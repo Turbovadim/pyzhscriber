@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-labelledby="title">
+<title id="title">Pyzhscriber: Folded P</title>
+<rect x="8" y="8" width="240" height="240" rx="54" fill="#000"/>
+<path d="M62 60 99 40v176l-37-17z" fill="#214FAE"/>
+<path d="M98 40h44c51 0 78 28 78 65 0 40-30 68-78 68H99v-42h43c22 0 34-9 34-26s-12-26-34-26H99z" fill="#377EFF"/>
+<path d="M99 131h43c22 0 34-9 34-26 0-4-1-8-2-11 19 15 22 35 8 53-10 14-26 21-44 21H99z" fill="#89BEFF"/>
+<path d="m62 60 37-20v91l-37 24z" fill="#5B98FF"/>
+<path d="m62 155 37-24v85l-37-17z" fill="#397EFF"/>
+<path d="M103 43h39c35 0 59 14 69 37" fill="none" stroke="#A2CDFF" stroke-width="3" stroke-linecap="round"/>
+<path d="M117 103v8M130 95v24M143 100v14" stroke="#D7EBFF" stroke-width="5" stroke-linecap="round"/>
+<path d="m62 199 37 17v-9l-37-17z" fill="#173B86"/>
+</svg>
+

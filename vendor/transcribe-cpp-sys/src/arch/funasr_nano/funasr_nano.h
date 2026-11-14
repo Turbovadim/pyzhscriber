@@ -8,6 +8,7 @@
 #include "causal_lm/causal_lm.h"
 #include "transcribe-backend.h"
 #include "transcribe-kaldi-fbank.h"
+#include "transcribe-load-common.h"
 #include "transcribe-model.h"
 #include "transcribe-session.h"
 #include "transcribe-tokenizer.h"
@@ -54,7 +55,7 @@ struct FunAsrNanoModel final : public transcribe_model {
     ggml_context *    ctx_meta = nullptr;
 
     transcribe::BackendPlan                    plan;
-    ggml_backend_buffer_t                      backend_buffer = nullptr;
+    transcribe::load_common::WeightStorage     weight_storage;
     transcribe::causal_lm::PackedGateUpHandles packed_gate_up;
 
     // Constructed once at load() time; const-after-construction. Kaldi
@@ -74,9 +75,6 @@ struct FunAsrNanoModel final : public transcribe_model {
 };
 
 struct FunAsrNanoSession final : public transcribe_session {
-    ggml_context *       compute_ctx = nullptr;
-    ggml_backend_sched_t sched       = nullptr;
-
     transcribe::causal_lm::KvCache kv_cache;
 
     // Batched KV cache for offline transcribe_run_batch (n_batch slabs).

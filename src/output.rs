@@ -43,8 +43,13 @@ fn paste_with_clipboard(text: &str, settings: &AppSettings) -> Result<()> {
     }
     if let Some(previous) = previous {
         // Give the target app time to read the clipboard before restoring it.
-        thread::sleep(Duration::from_millis(400));
-        clipboard.set_text(previous)?;
+        // Nothing waits on the restore, so it runs off the transcription path.
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(400));
+            if let Err(error) = clipboard.set_text(previous) {
+                log::warn!("failed to restore the clipboard: {error}");
+            }
+        });
     }
     Ok(())
 }

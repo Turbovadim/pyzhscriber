@@ -501,6 +501,133 @@ transcribe_status read_parakeet_hparams(const gguf_context * gguf, ParakeetHPara
         }
     }
 
+    // kestrel-runtime semantics. Both optional; absent keeps the NeMo behavior.
+    {
+        std::string masking;
+        if (auto st = read_optional_string_kv(gguf, "stt.parakeet.encoder.length_masking", kFamilyTag, "none", masking);
+            st != TRANSCRIBE_OK) {
+            return st;
+        }
+        if (masking != "none" && masking != "kestrel" && masking != "transformers") {
+            log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "parakeet: unsupported encoder.length_masking \"%s\"", masking.c_str());
+            return TRANSCRIBE_ERR_GGUF;
+        }
+        hp.kestrel_length_masking = (masking != "none");
+        hp.mask_after_pointwise   = (masking == "transformers");
+
+        std::string budget;
+        if (auto st = read_optional_string_kv(gguf, "stt.parakeet.tdt.symbol_budget", kFamilyTag, "per_frame", budget);
+            st != TRANSCRIBE_OK) {
+            return st;
+        }
+        if (budget != "per_frame" && budget != "global") {
+            log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "parakeet: unsupported tdt.symbol_budget \"%s\"", budget.c_str());
+            return TRANSCRIBE_ERR_GGUF;
+        }
+        hp.tdt_global_symbol_budget = (budget == "global");
+    }
+
+    // Long-form attention window. A full-attention GGUF (Regular,
+    // att_context (-1, -1)) runs NeMo's rel_pos_local_attn window
+    // [256, 256] by default: the same post-hoc switch as
+    // model.change_attention_model("rel_pos_local_attn", [256, 256]),
+    // which is the long-audio mode NVIDIA documents for the family. The
+    // band covers every clip up to 256 encoder frames (20.5 s) exactly;
+    // beyond that the encoder's work and scratch stay linear in T instead
+    // of quadratic. Numerics follow the Regular-local path
+    // (LocalAttRelPositionalEncoding), the same one parakeet-tdt_ctc-1.1b
+    // ships with. kestrel-masked checkpoints (parakeet-ultra) keep full
+    // attention: they cut long audio at pauses and their contract is
+    // kestrel's output. The streaming styles keep their trained menus.
+    constexpr int kLongformAttContext = 256;
+    if (hp.enc_att_context_style == ParakeetHParams::AttContextStyle::Regular && hp.enc_att_context_left < 0 &&
+        hp.enc_att_context_right < 0 && !hp.kestrel_length_masking) {
+        hp.enc_att_context_left  = kLongformAttContext;
+        hp.enc_att_context_right = kLongformAttContext;
+        hp.enc_att_context_size_choices.assign(1, std::make_pair(kLongformAttContext, kLongformAttContext));
+        log_msg(TRANSCRIBE_LOG_LEVEL_INFO, "parakeet: full-attention checkpoint; using local attention [%d, %d]",
+                kLongformAttContext, kLongformAttContext);
+    }
+#ifdef TRANSCRIBE_ENABLE_VALIDATION_HOOKS
+    // Validation-build sweep knob: TRANSCRIBE_PARAKEET_ATT_CONTEXT="L,R"
+    // replaces the Regular-style window (both -1 restores full attention).
+    // Not compiled into release builds.
+    if (const char * ov = std::getenv("TRANSCRIBE_PARAKEET_ATT_CONTEXT");
+        ov != nullptr && ov[0] != '\0' && hp.enc_att_context_style == ParakeetHParams::AttContextStyle::Regular) {
+        int l = -1, r = -1;
+        if (std::sscanf(ov, "%d,%d", &l, &r) != 2 || l < -1 || r < -1 || ((l < 0) != (r < 0))) {
+            log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
+                    "parakeet: TRANSCRIBE_PARAKEET_ATT_CONTEXT=\"%s\" is not \"L,R\" "
+                    "with both >= 0 (or both -1 for full attention)",
+                    ov);
+            return TRANSCRIBE_ERR_INVALID_ARG;
+        }
+        if (l != hp.enc_att_context_left || r != hp.enc_att_context_right) {
+            log_msg(TRANSCRIBE_LOG_LEVEL_INFO, "parakeet: att_context override (%d, %d) -> (%d, %d)",
+                    hp.enc_att_context_left, hp.enc_att_context_right, l, r);
+            hp.enc_att_context_left  = l;
+            hp.enc_att_context_right = r;
+            hp.enc_att_context_size_choices.assign(1, std::make_pair(l, r));
+        }
+    }
+#endif
+
+    // VAD head + long-form segmenter. Presence of stt.parakeet.vad.hidden is
+    // the gate; every other key is then required.
+    if (gguf_find_key(gguf, "stt.parakeet.vad.hidden") >= 0) {
+        hp.has_vad_head = true;
+        std::string activation;
+
+        const struct {
+            const char * key;
+            float *      out;
+        } f32_keys[] = {
+            { "stt.parakeet.vad.speech_threshold",          &hp.vad_speech_threshold    },
+            { "stt.parakeet.vad.min_speech_seconds",        &hp.vad_min_speech_seconds  },
+            { "stt.parakeet.vad.min_gap_seconds",           &hp.vad_min_gap_seconds     },
+            { "stt.parakeet.segmenter.max_segment_seconds", &hp.seg_max_segment_seconds },
+            { "stt.parakeet.segmenter.min_segment_seconds", &hp.seg_min_segment_seconds },
+            { "stt.parakeet.segmenter.min_pause_seconds",   &hp.seg_min_pause_seconds   },
+            { "stt.parakeet.segmenter.scan_block_seconds",  &hp.seg_scan_block_seconds  },
+        };
+
+        if (auto st = read_required_u32_kv(gguf, "stt.parakeet.vad.hidden", kFamilyTag, hp.vad_hidden);
+            st != TRANSCRIBE_OK) {
+            return st;
+        }
+        if (auto st = read_required_u32_kv(gguf, "stt.parakeet.vad.context_kernel", kFamilyTag, hp.vad_context_kernel);
+            st != TRANSCRIBE_OK) {
+            return st;
+        }
+        if (auto st = read_required_string_kv(gguf, "stt.parakeet.vad.activation", kFamilyTag, activation);
+            st != TRANSCRIBE_OK) {
+            return st;
+        }
+        for (const auto & k : f32_keys) {
+            if (auto st = read_required_f32_kv(gguf, k.key, kFamilyTag, *k.out); st != TRANSCRIBE_OK) {
+                return st;
+            }
+        }
+        if (activation != "silu" || hp.vad_hidden <= 0 || hp.vad_context_kernel <= 0 ||
+            (hp.vad_context_kernel % 2) == 0 || hp.seg_max_segment_seconds <= hp.seg_min_segment_seconds ||
+            hp.seg_scan_block_seconds < hp.seg_max_segment_seconds) {
+            log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
+                    "parakeet: unsupported vad/segmenter config (activation \"%s\", hidden %d, kernel %d)",
+                    activation.c_str(), hp.vad_hidden, hp.vad_context_kernel);
+            return TRANSCRIBE_ERR_GGUF;
+        }
+    }
+
+    if ((hp.kestrel_length_masking || hp.has_vad_head) &&
+        hp.enc_att_context_style != ParakeetHParams::AttContextStyle::Regular) {
+        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "parakeet: kestrel masking / VAD head require regular attention");
+        return TRANSCRIBE_ERR_GGUF;
+    }
+    if (hp.tdt_global_symbol_budget && hp.head_kind != HeadKind::TDT) {
+        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "parakeet: tdt.symbol_budget=global requires a TDT head");
+        return TRANSCRIBE_ERR_GGUF;
+    }
+
     // Speaker-kernel metadata is optional; absent means no injection.
     if (gguf_find_key(gguf, "stt.parakeet.encoder.spk_kernel_layers") >= 0) {
         switch (read_int32_array_kv(gguf, "stt.parakeet.encoder.spk_kernel_layers", hp.spk_kernel_layers)) {
@@ -936,6 +1063,18 @@ transcribe_status build_parakeet_weights(ggml_context *          ctx_meta,
             }
             weights.spk_kernels.push_back(kernel);
         }
+    }
+
+    // ----- optional VAD head -----
+    if (hp.has_vad_head) {
+        const int h  = hp.vad_hidden;
+        const int kc = hp.vad_context_kernel;
+        GET_CONV(weights.vad.proj_w, "vad.proj.weight", 1, d_model, h);
+        GET_F32(weights.vad.proj_b, "vad.proj.bias", h);
+        GET_CONV(weights.vad.ctx_w, "vad.ctx.weight", kc, h, h);
+        GET_F32(weights.vad.ctx_b, "vad.ctx.bias", h);
+        GET_CONV(weights.vad.out_w, "vad.out.weight", 1, h, 1);
+        GET_F32(weights.vad.out_b, "vad.out.bias", 1);
     }
 
     return TRANSCRIBE_OK;

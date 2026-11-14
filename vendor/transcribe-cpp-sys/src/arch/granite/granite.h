@@ -27,6 +27,7 @@
 #include "ggml-backend.h"
 #include "ggml.h"
 #include "transcribe-backend.h"
+#include "transcribe-load-common.h"
 #include "transcribe-mel.h"
 #include "transcribe-model.h"
 #include "transcribe-session.h"
@@ -71,8 +72,8 @@ struct GraniteModel final : public transcribe_model {
     GraniteWeights weights;
     ggml_context * ctx_meta = nullptr;
 
-    transcribe::BackendPlan plan;
-    ggml_backend_buffer_t   backend_buffer = nullptr;
+    transcribe::BackendPlan                plan;
+    transcribe::load_common::WeightStorage weight_storage;
 
     // Pre-fused BatchNorm scale + bias for every encoder block. Lives
     // in a separate ggml context + backend buffer so we can write the
@@ -104,9 +105,6 @@ struct GraniteModel final : public transcribe_model {
 };
 
 struct GraniteSession final : public transcribe_session {
-    ggml_context *       compute_ctx = nullptr;
-    ggml_backend_sched_t sched       = nullptr;
-
     // Audio encoder output (post-projector) buffered between encode and
     // decode. Each row is one audio token in LM hidden space (2048).
     std::vector<float> mel_buf;

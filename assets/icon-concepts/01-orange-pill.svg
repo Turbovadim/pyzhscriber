@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-labelledby="title">
+<title id="title">Pyzhscriber: Orange pill</title>
+<rect x="8" y="8" width="240" height="240" rx="54" fill="#000"/>
+<rect x="40" y="80" width="176" height="96" rx="48" fill="#FF7426"/>
+<g stroke="#000" stroke-width="12" stroke-linecap="round">
+<path d="M80 119v18M104 106v44M128 96v64M152 110v36M176 119v18"/>
+</g>
+</svg>
+

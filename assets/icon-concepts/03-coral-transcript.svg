@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-labelledby="title">
+<title id="title">Pyzhscriber: Coral transcript</title>
+<rect x="8" y="8" width="240" height="240" rx="54" fill="#000"/>
+<path d="M60 56h136a20 20 0 0 1 20 20v88a20 20 0 0 1-20 20h-76l-48 28v-28H60a20 20 0 0 1-20-20V76a20 20 0 0 1 20-20Z" fill="#FF635C"/>
+<path d="M80 96h96M80 120h72M80 144h44" fill="none" stroke="#000" stroke-width="12" stroke-linecap="round"/>
+</svg>
+

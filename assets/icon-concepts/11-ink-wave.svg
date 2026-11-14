@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-labelledby="title">
+<title id="title">Pyzhscriber: Ink wave</title>
+<rect x="8" y="8" width="240" height="240" rx="54" fill="#000"/>
+<path d="m51 214 30-116 109-57 20 24-54 113z" fill="#0D746E"/>
+<path d="m45 204 34-111 107-58 22 24-61 108z" fill="#38D9BE"/>
+<path d="m45 204 97-91 44-78-107 58z" fill="#6EF0D1"/>
+<path d="m186 35 22 24-17 30-32-32z" fill="#B9FFE4"/>
+<path d="m45 204 64-63c10-10 5-18 14-26s17-3 26-13l15-18" fill="none" stroke="#052F34" stroke-width="8" stroke-linecap="round"/>
+<circle cx="141" cy="106" r="11" fill="#052F34"/>
+<path d="m84 100 65-35" stroke="#BEFFE4" stroke-width="3" stroke-linecap="round"/>
+<path d="M67 223c30-12 36-2 58-9s27-20 54-15" fill="none" stroke="#2EBCA9" stroke-width="6" stroke-linecap="round"/>
+</svg>
+

@@ -16,6 +16,7 @@
 #include "ggml-backend.h"
 #include "ggml.h"
 #include "transcribe-backend.h"
+#include "transcribe-load-common.h"
 #include "transcribe-mel.h"
 #include "transcribe-model.h"
 #include "transcribe-session.h"
@@ -55,10 +56,12 @@ void build_audio_span(const MossHParams &    hp,
 // out_audio_positions holds the absolute prompt positions of the audio_pad
 // tokens (in order), so the b-th audio feature is scattered to
 // input_ids[out_audio_positions[b]].
-void build_prompt_tokens(const MossHParams &    hp,
-                         int                    audio_seq_len,
-                         std::vector<int32_t> & out_ids,
-                         std::vector<int32_t> & out_audio_positions);
+// `suffix` overrides hp.prompt_suffix_tokens (the hotword-extended suffix).
+void build_prompt_tokens(const MossHParams &          hp,
+                         int                          audio_seq_len,
+                         std::vector<int32_t> &       out_ids,
+                         std::vector<int32_t> &       out_audio_positions,
+                         const std::vector<int32_t> * suffix = nullptr);
 
 struct MossModel final : public transcribe_model {
     Tokenizer      tok;
@@ -67,7 +70,7 @@ struct MossModel final : public transcribe_model {
     ggml_context * ctx_meta = nullptr;
 
     transcribe::BackendPlan                    plan;
-    ggml_backend_buffer_t                      backend_buffer = nullptr;
+    transcribe::load_common::WeightStorage     weight_storage;
     transcribe::causal_lm::PackedGateUpHandles packed_gate_up;
 
     std::optional<transcribe::MelFrontend> mel;
@@ -81,9 +84,6 @@ struct MossModel final : public transcribe_model {
 };
 
 struct MossSession final : public transcribe_session {
-    ggml_context *       compute_ctx = nullptr;
-    ggml_backend_sched_t sched       = nullptr;
-
     transcribe::causal_lm::KvCache kv_cache;
 
     // Batched KV cache for offline transcribe_run_batch (n_batch slabs).

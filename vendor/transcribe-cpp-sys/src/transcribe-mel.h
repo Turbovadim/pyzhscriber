@@ -59,6 +59,9 @@ struct MelConfig {
     //   "hann_periodic"  — torch.hann_window(N, periodic=True):
     //                      cos(2*pi*k / N). Used by Whisper (and
     //                      Qwen3-ASR's Whisper frontend).
+    //   "hamming_periodic" — torch.hamming_window(N, periodic=True):
+    //                      0.54 - 0.46*cos(2*pi*k / N). Used by
+    //                      SpeechBrain (ecapa_tdnn).
     std::string window_type = "hann_symmetric";
 
     // Normalization mode:
@@ -78,6 +81,12 @@ struct MelConfig {
     //                      per-utterance maximum, so each frame is
     //                      causal/streaming-safe. Still drops the trailing
     //                      center-pad STFT frame.
+    //   "sentence_mean" — SpeechBrain Fbank + InputNormalization(norm_type=
+    //                     "sentence", std_norm=False): power-to-dB
+    //                     10*log10(max(x, log_clamp_min)), then the
+    //                     optional top_db floor, then subtract each mel
+    //                     bin's mean over ALL frames (no variance). No frame
+    //                     is dropped or masked. Used by ecapa_tdnn.
     std::string normalize = "per_feature";
 
     // Fixed log-mel maximum for normalize == "global" (Voxtral Realtime
@@ -93,7 +102,14 @@ struct MelConfig {
     // When > 0 AND normalize="none", emit log(max(power, log_clamp_min))
     // instead of NeMo's log(power + kLogEps). LASR / MedASR use this with
     // log_clamp_min = 1e-5; NeMo's frontends leave it at 0.0.
+    // normalize="sentence_mean" uses it as the dB floor (amin) instead;
+    // 0.0 there falls back to 1e-10.
     float log_clamp_min = 0.0f;
+
+    // normalize="sentence_mean" only: per-utterance dynamic-range floor
+    // over time AND frequency, x = max(x, max_all(x) - top_db), applied
+    // in dB before the mean subtraction. <= 0 disables it.
+    float top_db = 0.0f;
 
     // Optional checkpoint-provided window [win_length]. When non-empty,
     // used instead of computing a periodic Hann window.
@@ -131,6 +147,16 @@ class MelFrontend {
     // is handed to cblas_sgemm and is already multi-threaded on
     // Accelerate / OpenBLAS.
     //
+    // out_frames overrides how many leading frames the per_utterance /
+    // global normalize modes emit. 0 (default) keeps each mode's own
+    // rule, which drops the trailing center-pad frame. granite5_ctc
+    // needs 2*ceil(floor(n/hop)/2) frames, which equals n_frames-1 when
+    // floor(n/hop) is even and n_frames when it is odd, so the count is
+    // a per-utterance property and cannot live in MelConfig. The
+    // per-utterance max is taken over exactly the emitted frames, which
+    // is what the reference's `mel[..., :num_frames].amax()` does.
+    // Ignored by per_feature / none.
+    //
     // Returns:
     //   TRANSCRIBE_OK              normal success.
     //   TRANSCRIBE_ERR_INVALID_ARG pcm is null, or n_samples is too
@@ -142,8 +168,9 @@ class MelFrontend {
                               std::vector<float> & out_mel,
                               int &                out_n_mels,
                               int &                out_n_frames,
-                              int                  n_threads = 0,
-                              MelLayout            layout = MelLayout::ChannelMajor,
+                              int                  n_threads   = 0,
+                              int                  out_frames  = 0,
+                              MelLayout            layout      = MelLayout::ChannelMajor,
                               size_t               min_samples = 0) const;
 
     // Number of mel bins (matches MelConfig::num_mels).
@@ -169,6 +196,11 @@ class MelFrontend {
     int                 n_freq_;  // n_fft/2 + 1
     std::vector<double> window_;  // [n_fft], periodic hann zero-padded
     std::vector<float>  mel_fb_;  // [num_mels * n_freq] row-major, Slaney
+    // Per mel row: the scalar matmul runs over [fb_lo_, fb_hi_) only.
+    // fb_lo_ is rounded down to a multiple of 4 so the 4-wide groups stay
+    // aligned; the skipped weights are all zero, so the sum is unchanged.
+    std::vector<int>    fb_lo_;
+    std::vector<int>    fb_hi_;
 
     // sin/cos LUT for the mixed-radix FFT. Sized to n_fft so that every
     // recursion-level N (n_fft, n_fft/2, n_fft/4, ..., odd leaf) divides

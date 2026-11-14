@@ -4,10 +4,10 @@
 // self-attention, GLU conv module with conv_expansion=2, macaron FFN,
 // mid-layer self-conditioned CTC bypass). NLE additions:
 //
-//   - A second CTC head over a BPE vocab. We emit
-//     frame-level logits as `enc.ctc_bpe_logits` here; the
-//     posterior-weighted window pool + greedy decode runs host-side at
-//     run() time.
+//   - A second CTC head over a BPE vocab, applied to posterior-weighted
+//     window pools of the final hidden state. The pool and the argmax run
+//     in-graph; only per-window ids reach the host, where the greedy
+//     collapse runs at run() time.
 //   - All-hidden-states capture: we tap the per-block POST-LN output at
 //     indices specified by hp.enc_layer_indices (e.g. [4, 8, 12, -1]
 //     1-indexed → block outputs after 3, 7, 11, 15). These are
@@ -114,21 +114,29 @@ transcribe_status compute_mel_encoder_input(const transcribe::MelFrontend & mel,
 
 // Shaw bookkeeping (matches AR granite).
 
-std::vector<int32_t> precompute_attention_dists(int context_size, int max_pos_emb) {
-    std::vector<int32_t> dists(static_cast<size_t>(context_size) * context_size);
-    for (int c = 0; c < context_size; ++c) {
-        for (int r = 0; r < context_size; ++r) {
-            int d = c - r;
-            if (d < -context_size) {
-                d = -context_size;
-            }
-            if (d > context_size) {
-                d = context_size;
-            }
-            dists[static_cast<size_t>(c) * context_size + r] = static_cast<int32_t>(d + max_pos_emb);
+std::vector<int32_t> precompute_pos_rows(int context_size, int max_pos_emb) {
+    // One rel_pos_emb row per distinct relative offset, replacing the full
+    // [context_size, context_size] table. The table's value at
+    // (ne0 = key, ne1 = query) is clamp(query - key, +/- context_size) +
+    // max_pos_emb, which depends on (query - key) alone, so only the
+    // 2*context_size - 1 reachable offsets are needed.
+    //
+    // shaw_block_attn's skew path indexes this vector by
+    // d = key - query + context_size - 1 (the layout conformer::rel_shift
+    // rotates), so slot d must carry the offset context_size - 1 - d.
+    const int            n = 2 * context_size - 1;
+    std::vector<int32_t> rows(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        int d = context_size - 1 - i;
+        if (d < -context_size) {
+            d = -context_size;
         }
+        if (d > context_size) {
+            d = context_size;
+        }
+        rows[static_cast<size_t>(i)] = static_cast<int32_t>(d + max_pos_emb);
     }
-    return dists;
+    return rows;
 }
 
 std::vector<float> precompute_last_block_mask(int context_size, int t_enc_remainder) {
@@ -182,11 +190,24 @@ ggml_tensor * conv_module(ggml_context *             ctx,
     }
     x                 = ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3));
     const int padding = (conv_kernel - 1) / 2;
-    x                 = transcribe::conformer::conv_1d_dw_f32(ctx, b.conv_depthwise_w, x,
-                                                              /*stride=*/1, /*padding=*/padding, /*dilation=*/1);
-    x                 = transcribe::conformer::fused_batch_norm(ctx, x, bn_fused_scale, bn_fused_bias);
-    x                 = ggml_silu(ctx, x);
-    x                 = ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3));
+    // Direct depthwise op, not conv_1d_dw_f32's im2col + mul_mat: im2col
+    // materialises a [conv_kernel, T, inner_dim] f32 copy (15 x 2048 x 50
+    // frames/s: ~1.9 GB at 5 minutes, the encoder's largest tensor once the
+    // BPE head is pooled) to feed a matmul whose K is only conv_kernel. Same
+    // swap as granite5_ctc (see its encoder.cpp); not bitwise identical
+    // (accumulation order), so it is gated by the family's dump parity.
+    {
+        ggml_tensor * knl = ggml_reshape_4d(ctx, b.conv_depthwise_w, conv_kernel, 1, 1, inner_dim);
+        ggml_tensor * img = ggml_reshape_4d(ctx, x, T, 1, inner_dim, 1);
+        x                 = transcribe::conformer::conv_2d_dw_direct_f32(ctx, knl, img,
+                                                                         /*s0=*/1, /*s1=*/1,
+                                                                         /*p0=*/padding, /*p1=*/0,
+                                                                         /*d0=*/1, /*d1=*/1);
+        x                 = ggml_reshape_2d(ctx, x, T, inner_dim);
+    }
+    x = transcribe::conformer::fused_batch_norm(ctx, x, bn_fused_scale, bn_fused_bias);
+    x = ggml_silu(ctx, x);
+    x = ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3));
     {
         ggml_tensor * pw2 = ggml_reshape_2d(ctx, b.conv_pointwise2_w, inner_dim, d_model);
         x                 = ggml_mul_mat(ctx, pw2, x);
@@ -220,9 +241,9 @@ EncoderBuild build_encoder_graph(ggml_context *            ctx,
     named(eb.mel_in, "enc.mel_in");
     ggml_set_input(eb.mel_in);
 
-    eb.attention_dists = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, static_cast<int64_t>(ctx_size) * ctx_size);
-    named(eb.attention_dists, "enc.attention_dists");
-    ggml_set_input(eb.attention_dists);
+    eb.pos_rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 2 * static_cast<int64_t>(ctx_size) - 1);
+    named(eb.pos_rows, "enc.pos_rows");
+    ggml_set_input(eb.pos_rows);
 
     eb.last_block_mask = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ctx_size, ctx_size, eb.n_blocks_local);
     named(eb.last_block_mask, "enc.last_block_mask");
@@ -277,8 +298,8 @@ EncoderBuild build_encoder_graph(ggml_context *            ctx,
             b.norm_attn_w, b.norm_attn_b, b.attn_q_w, b.attn_kv_w, b.attn_rel_pos_emb, b.attn_out_w, b.attn_out_b,
         };
         ggml_tensor * attn_out = transcribe::granite_conformer::shaw_block_attn(
-            ctx, x, eb.zero_pad, eb.attention_dists, eb.last_block_mask, shaw_w, n_heads, head_dim, ctx_size,
-            eb.n_blocks_local, T_enc, kLayerNormEps);
+            ctx, x, eb.zero_pad, /*dists=*/nullptr, eb.last_block_mask, shaw_w, n_heads, head_dim, ctx_size,
+            eb.n_blocks_local, T_enc, kLayerNormEps, eb.pos_rows);
         if (attn_out == nullptr) {
             return eb;
         }
@@ -384,14 +405,56 @@ EncoderBuild build_encoder_graph(ggml_context *            ctx,
         }
     }
 
-    // Frame-level BPE CTC head (the pool happens host-side).
-    ggml_tensor * ctc_bpe = nullptr;
-    if (weights.enc_top.ctc_bpe_w != nullptr) {
-        ctc_bpe = ggml_mul_mat(ctx, weights.enc_top.ctc_bpe_w, x);
-        ctc_bpe = ggml_add(ctx, ctc_bpe, weights.enc_top.ctc_bpe_b);
-        named(ctc_bpe, "enc.ctc_bpe_logits");
-        eb.ctc_bpe_logits = ctc_bpe;
-        ggml_set_output(ctc_bpe);
+    // Pooled BPE CTC head. The reference forms, per pool window of P frames,
+    // the importance-weighted mean of the frame-level BPE logits and takes its
+    // argmax. Done literally that is a [bpe_output_dim, T_enc] f32 tensor
+    // (100352 x 50 frames/s: 6.1 GB of scratch at 5 minutes, then copied to
+    // host). The head is affine and the window weights sum to 1, so
+    //   sum_t w_t (W h_t + b) = W (sum_t w_t h_t) + b
+    // and we pool the 1024-wide hidden states first, then run the head on
+    // n_windows = T_enc / P columns in tiles, with the argmax in-graph. Only
+    // the per-window ids and masses leave the device.
+    if (weights.enc_top.ctc_bpe_w != nullptr && eb.mid_blank_probs != nullptr && hp.enc_bpe_pool_window > 0) {
+        const int64_t P     = hp.enc_bpe_pool_window;
+        const int64_t n_win = (T_enc + P - 1) / P;
+        const int64_t T_win = n_win * P;
+
+        // importance = 1 - p_blank(mid CTC), zero-padded to whole windows so
+        // the partial last window pools only its real frames.
+        ggml_tensor * imp = ggml_scale_bias(ctx, eb.mid_blank_probs, -1.0f, 1.0f);  // [T_enc]
+        ggml_tensor * h   = x;                                                      // [d_model, T_enc]
+        if (T_win > T_enc) {
+            imp = ggml_pad(ctx, imp, static_cast<int>(T_win - T_enc), 0, 0, 0);
+            h   = ggml_pad(ctx, h, 0, static_cast<int>(T_win - T_enc), 0, 0);
+        }
+        imp                = ggml_reshape_2d(ctx, imp, P, n_win);
+        ggml_tensor * mass = ggml_sum_rows(ctx, imp);  // [1, n_win]
+        named(mass, "enc.bpe_window_mass");
+        ggml_set_output(mass);
+        eb.bpe_window_mass = mass;
+        eb.n_bpe_windows   = static_cast<int>(n_win);
+
+        // All-blank windows (mass ~ 0) are blank on the host; the clamp only
+        // keeps their weights finite.
+        ggml_tensor * wt = ggml_div(ctx, imp, ggml_clamp(ctx, mass, 1e-9f, std::numeric_limits<float>::max()));
+
+        // pooled[:, w] = sum_p wt[p, w] * h[:, w*P + p]
+        ggml_tensor * hw =
+            ggml_mul(ctx, ggml_reshape_3d(ctx, h, d_model, P, n_win), ggml_reshape_3d(ctx, wt, 1, P, n_win));
+        hw                   = ggml_cont(ctx, ggml_permute(ctx, hw, 1, 0, 2, 3));  // [P, d_model, n_win]
+        ggml_tensor * pooled = ggml_reshape_2d(ctx, ggml_sum_rows(ctx, hw), d_model, n_win);
+        named(pooled, "enc.bpe_pooled");
+
+        for (int64_t w0 = 0; w0 < n_win; w0 += kBpeTileWindows) {
+            const int64_t n = std::min<int64_t>(kBpeTileWindows, n_win - w0);
+            ggml_tensor * pv =
+                ggml_view_2d(ctx, pooled, d_model, n, pooled->nb[1], static_cast<size_t>(w0) * pooled->nb[1]);
+            ggml_tensor * lg = ggml_mul_mat(ctx, weights.enc_top.ctc_bpe_w, pv);
+            lg               = ggml_add(ctx, lg, weights.enc_top.ctc_bpe_b);
+            ggml_tensor * id = ggml_argmax(ctx, lg);  // [n] i32
+            ggml_set_output(id);
+            eb.bpe_window_ids.push_back(id);
+        }
     }
 
     // Channel concat of captured layer outputs. Walk captures in order
@@ -420,11 +483,16 @@ EncoderBuild build_encoder_graph(ggml_context *            ctx,
     }
     ggml_build_forward_expand(eb.graph, eb.cat_out);
     ggml_build_forward_expand(eb.graph, eb.ctc_logits);
-    if (eb.ctc_bpe_logits) {
-        ggml_build_forward_expand(eb.graph, eb.ctc_bpe_logits);
-    }
     if (eb.mid_blank_probs) {
         ggml_build_forward_expand(eb.graph, eb.mid_blank_probs);
+    }
+    if (eb.bpe_window_mass) {
+        ggml_build_forward_expand(eb.graph, eb.bpe_window_mass);
+    }
+    // Expanded in order so each tile's logits are retired before the next
+    // tile's are allocated.
+    for (ggml_tensor * id : eb.bpe_window_ids) {
+        ggml_build_forward_expand(eb.graph, id);
     }
     if (eb.dumps.input_linear_out) {
         ggml_build_forward_expand(eb.graph, eb.dumps.input_linear_out);
@@ -457,7 +525,34 @@ EncoderBuild build_encoder_graph(ggml_context *            ctx,
     return eb;
 }
 
-// Host-side BPE CTC pool + greedy decode.
+// Collapse for the in-graph pooled BPE head.
+
+bool collapse_bpe_window_ids(const std::vector<int32_t> & window_ids,
+                             const std::vector<float> &   window_mass,
+                             int                          blank_id,
+                             std::vector<int32_t> &       out_token_ids) {
+    out_token_ids.clear();
+    if (window_ids.size() != window_mass.size()) {
+        return false;
+    }
+    const size_t n_windows = window_ids.size();
+    out_token_ids.reserve(n_windows);
+    // Same greedy + collapse-repeats + drop-blanks as
+    // compute_bpe_ctc_initial_hypothesis, including the all-blank-window rule
+    // and the two blank_id schemes.
+    const int shift = (blank_id == 0) ? 1 : 0;
+    int       prev  = -1;
+    for (size_t w = 0; w < n_windows; ++w) {
+        const int id = (window_mass[w] <= 1e-9f) ? blank_id : window_ids[w];
+        if (id != blank_id && id != prev) {
+            out_token_ids.push_back(id - shift);
+        }
+        prev = id;
+    }
+    return true;
+}
+
+// Host-side BPE CTC pool + greedy decode (reference formulation).
 
 void compute_bpe_ctc_initial_hypothesis(const std::vector<float> & importance_non_blank,
                                         const std::vector<float> & ctc_bpe_logits,

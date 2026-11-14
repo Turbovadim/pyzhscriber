@@ -1,5 +1,7 @@
 # Canary GPU performance
 
+> **Since the 0.4.1 merge (November 2026):** these measurements were taken against the 0.2.2 engine. Upstream 0.4.1 added its own read-only weight mapping (`transcribe-mmap.cpp`, `load_common::WeightStorage`), which replaced the local mapping helper described here, including for the Core ML decoder-only path and its encoder fallback. Over 100 local recordings, the merged engine's Whisper and Canary output matched unmodified 0.4.1 exactly. The remaining local changes kept Whisper about 5% and Canary about 9% faster than unmodified 0.4.1.
+
 Implemented September 11, 2026. Baseline: `3ce6e1e12e9a1a8bf7a1e720dbee076be756f9ac`.
 
 This report covers the changes committed as `3b34cb4`. See the [encoder follow-up](canary-encoder-performance.md) for subsequent speed measurements and validation.
@@ -90,7 +92,7 @@ python3 scripts/build-canary-bench.py NATIVE_PREFIX canary_bench --sdk "$SDKROOT
 ./canary_bench MODEL.gguf MANIFEST.tsv 1
 ```
 
-Each manifest line is a 16 kHz mono PCM16 WAV path, optionally followed by a tab and language code. Place the same `default-tensor.metallib` beside both benchmark binaries to avoid comparing precompiled shader loading with source compilation. The runner also supports session reuse, model reloads, CPU, F32 KV, context limits, translation and punctuation-off checks; see [its source](../examples/canary_bench.cpp) for arguments.
+Each manifest line is a 16 kHz mono PCM16 WAV path, optionally followed by a tab and language code. Place the same `default.metallib` and `ggml-tensor.metallib` (built by `scripts/package-macos.sh`) beside both benchmark binaries to avoid comparing precompiled shader loading with source compilation. The runner also supports session reuse, model reloads, CPU, F32 KV, context limits, translation and punctuation-off checks; see [its source](../examples/canary_bench.cpp) for arguments.
 
 ```bash
 python3 scripts/test-whisper-native.py NATIVE_PREFIX \

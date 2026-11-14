@@ -101,19 +101,10 @@ impl HistoryStore {
         let path = self
             .recordings_dir
             .join(format!("pyzhscriber-{}.wav", Utc::now().timestamp_millis()));
-        let mut writer = hound::WavWriter::create(
-            &path,
-            hound::WavSpec {
-                channels: 1,
-                sample_rate: 16_000,
-                bits_per_sample: 16,
-                sample_format: hound::SampleFormat::Int,
-            },
+        crate::audio::write_wav(
+            audio,
+            std::io::BufWriter::new(std::fs::File::create(&path)?),
         )?;
-        for sample in audio {
-            writer.write_sample((sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)?;
-        }
-        writer.finalize()?;
         Ok(path)
     }
 }

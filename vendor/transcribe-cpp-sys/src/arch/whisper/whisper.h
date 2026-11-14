@@ -4,10 +4,10 @@
 
 #pragma once
 
-#include "transcribe-weights-mmap.h"
 #include "ggml-backend.h"
 #include "ggml.h"
 #include "transcribe-backend.h"
+#include "transcribe-load-common.h"
 #include "transcribe-mel.h"
 #include "transcribe-model.h"
 #include "transcribe-session.h"
@@ -265,22 +265,19 @@ struct WhisperModel final : public transcribe_model {
 
 #ifdef TRANSCRIBE_USE_COREML
     // Optional Core ML encoder companion. While it is healthy, ctx_meta and
-    // backend_buffer contain decoder tensors only. The GGUF encoder is loaded
+    // weight_storage hold decoder tensors only. The GGUF encoder is loaded
     // into the fallback fields once, and only if a prediction fails.
     WhisperCoreMlContext * coreml_encoder = nullptr;
     std::atomic<bool>      coreml_healthy{true};
     std::string            coreml_fallback_path;
     std::mutex             coreml_fallback_mutex;
-    ggml_context *         encoder_ctx_meta       = nullptr;
-    ggml_backend_buffer_t  encoder_backend_buffer = nullptr;
-    std::unique_ptr<load_common::WeightMapping> encoder_mapping;
+    ggml_context *                         encoder_ctx_meta = nullptr;
+    transcribe::load_common::WeightStorage encoder_weight_storage;
 #endif
 
     // Runtime backend plan. See transcribe-backend.h.
-    transcribe::BackendPlan plan;
-    ggml_backend_buffer_t   backend_buffer = nullptr;
-    // Weight file pages remain mapped through buffer and backend teardown.
-    std::unique_ptr<load_common::WeightMapping> weight_mapping;
+    transcribe::BackendPlan                plan;
+    transcribe::load_common::WeightStorage weight_storage;
 
     // Language token ids keyed by BCP-47 short code (from general.languages).
     // Resolves a params.language string to the <|lang_xx|> token id (whisper
@@ -300,12 +297,10 @@ struct WhisperModel final : public transcribe_model {
 };
 
 struct WhisperSession final : public transcribe_session {
-    ggml_context * compute_ctx = nullptr;
     // Currently-allocated capacity of compute_ctx (mem_size). Used by
     // ensure_compute_ctx to decide between ggml_reset (cheap reuse)
     // and ggml_free + ggml_init (only when more space is needed).
-    size_t               compute_ctx_size = 0;
-    ggml_backend_sched_t sched            = nullptr;
+    size_t compute_ctx_size = 0;
 
     // Persistent backend-resident encoder output (see WhisperEncOut).
     WhisperEncOut enc_out;
@@ -341,6 +336,7 @@ struct WhisperSession final : public transcribe_session {
 
     WhisperSession() = default;
     ~WhisperSession() override;
+    void on_scratch_released() noexcept override;
 };
 
 } // namespace transcribe::whisper

@@ -3,10 +3,15 @@ use crate::controller::AppController;
 use crate::tray::AppTray;
 use crate::ui::RootView;
 use gpui::{
-    App, AppContext, Bounds, KeyBinding, Menu, MenuItem, SystemMenuType, WindowBounds,
-    WindowOptions, actions, point, px, size,
+    App, AppContext, Bounds, KeyBinding, Menu, MenuItem, OsAction, SystemMenuType, Window,
+    WindowBounds, WindowHandle, WindowOptions, actions, point, px, size,
 };
 use gpui_platform::application;
+
+#[derive(Clone, Copy)]
+struct MainWindow(WindowHandle<RootView>);
+
+impl gpui::Global for MainWindow {}
 
 pub fn run() {
     let instance_path = std::env::temp_dir().join("com.yolki.pyzhscriber.instance.lock");
@@ -23,11 +28,20 @@ pub fn run() {
             .unwrap_or_default()
     );
     let controller = AppController::new().expect("initialize Pyzhscriber");
+    let _cli_server = crate::ipc::Server::start(&controller)
+        .map_err(|error| log::error!("CLI server failed to start: {error:#}"))
+        .ok();
     // Always start the tap: it reports its own failure, and Input Monitoring can
     // be granted while the app is running.
     controller.start();
 
-    application().with_assets(Assets).run(move |cx: &mut App| {
+    let application = application().with_assets(Assets);
+    application.on_reopen(|cx| {
+        if let Some(MainWindow(window)) = cx.try_global::<MainWindow>().copied() {
+            show_main_window(window, cx);
+        }
+    });
+    application.run(move |cx: &mut App| {
         gpui_tokio::init(cx);
         let controller_for_quit = controller.clone();
         cx.on_app_quit(move |_| {
@@ -37,12 +51,10 @@ pub fn run() {
             std::future::ready(())
         })
         .detach();
-        // A regular app so Pyzhscriber has a Dock icon and a menu bar. What keeps
-        // the synthesized paste in the user's text field is that nothing on the
-        // recording path activates: the overlay is a non-activating panel, so the
-        // app they are dictating into stays frontmost throughout.
-        set_regular_activation_policy();
         let settings = controller.settings();
+        // Set the policy before creating windows or the menu bar item. Recording
+        // uses a non-activating panel, keeping the dictation target frontmost.
+        set_dock_visible(!settings.hide_from_dock);
         let visible = !settings.start_hidden;
         let bounds = Bounds::centered(None, size(px(960.0), px(700.0)), cx);
         let controller_for_window = controller.clone();
@@ -65,14 +77,16 @@ pub fn run() {
                     ..Default::default()
                 },
                 move |window, cx| {
-                    window.on_window_should_close(cx, |_, cx| {
-                        cx.hide();
+                    follow_active_space(window);
+                    window.on_window_should_close(cx, |window, cx| {
+                        dismiss_main_window(window, cx);
                         false
                     });
                     cx.new(|cx| RootView::new(controller_for_window.clone(), cx))
                 },
             )
             .expect("open Pyzhscriber window");
+        cx.set_global(MainWindow(main_window));
         register_menus(cx, controller.clone(), main_window);
         AppTray::listen(controller.clone(), main_window, cx);
         // An accessory app orders new windows in behind whatever is frontmost, so
@@ -85,9 +99,81 @@ pub fn run() {
     });
 }
 
+pub(crate) fn show_main_window(main_window: WindowHandle<RootView>, cx: &mut App) {
+    cx.activate(true);
+    let _ = main_window.update(cx, |_, window, _| window.activate_window());
+}
+
+/// GPUI owns the returned NSWindow for the lifetime of `window`.
 #[cfg(target_os = "macos")]
-fn set_regular_activation_policy() {
-    set_dock_visible(true);
+fn native_window(window: &Window) -> Option<*mut objc2::runtime::AnyObject> {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let handle = HasWindowHandle::window_handle(window).ok()?;
+    let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+        return None;
+    };
+    let view = handle.ns_view.as_ptr().cast::<AnyObject>();
+    let native: *mut AnyObject = unsafe { msg_send![view, window] };
+    (!native.is_null()).then_some(native)
+}
+
+/// A window reopened from another Space stays assigned to the Space it was
+/// closed on, which leaves it invisible until something drags it on screen.
+/// Moving it to the active Space makes it appear where the user asked for it.
+#[cfg(target_os = "macos")]
+fn follow_active_space(window: &Window) {
+    use objc2::msg_send;
+
+    const MOVE_TO_ACTIVE_SPACE: usize = 1 << 1;
+
+    if let Some(native) = native_window(window) {
+        unsafe {
+            let behavior: usize = msg_send![native, collectionBehavior];
+            let _: () = msg_send![native, setCollectionBehavior: behavior | MOVE_TO_ACTIVE_SPACE];
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn follow_active_space(_: &Window) {}
+
+/// Keep RootView alive to handle recording events, but remove its window from
+/// the screen so showing the recording panel cannot restore it with the app.
+#[cfg(target_os = "macos")]
+fn dismiss_main_window(window: &Window, _: &mut App) {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+
+    if let Some(native) = native_window(window) {
+        unsafe {
+            let _: () = msg_send![native, orderOut: std::ptr::null::<AnyObject>()];
+        }
+    }
+}
+
+/// Open means on screen or minimized to the Dock.
+#[cfg(target_os = "macos")]
+pub(crate) fn is_main_window_open(window: &Window) -> bool {
+    use objc2::msg_send;
+
+    native_window(window).is_some_and(|native| unsafe {
+        let visible: bool = msg_send![native, isVisible];
+        let minimized: bool = msg_send![native, isMiniaturized];
+        visible || minimized
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn is_main_window_open(_: &Window) -> bool {
+    true
+}
+
+#[cfg(not(target_os = "macos"))]
+fn dismiss_main_window(_: &Window, cx: &mut App) {
+    cx.hide();
 }
 
 #[cfg(target_os = "macos")]
@@ -97,16 +183,16 @@ pub(crate) fn set_dock_visible(visible: bool) {
 
     if let Some(mtm) = MainThreadMarker::new() {
         let app = NSApplication::sharedApplication(mtm);
-        app.setActivationPolicy(if visible {
+        let policy = if visible {
             NSApplicationActivationPolicy::Regular
         } else {
             NSApplicationActivationPolicy::Accessory
-        });
+        };
+        if app.activationPolicy() != policy {
+            app.setActivationPolicy(policy);
+        }
     }
 }
-
-#[cfg(not(target_os = "macos"))]
-fn set_regular_activation_policy() {}
 
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn set_dock_visible(_: bool) {}
@@ -122,9 +208,19 @@ actions!(
         Hide,
         HideOthers,
         ShowAll,
-        CloseWindow
+        CloseWindow,
+        Cut,
+        Copy,
+        Paste,
+        SelectAll
     ]
 );
+
+/// Key context no GPUI element sets. Edit bindings live here so they only
+/// give the Edit menu its shortcuts: the menu sends the native `paste:` etc.
+/// to native text fields (the dialogs), while key handling in GPUI views,
+/// such as paste into the model search, stays untouched.
+const NATIVE_TEXT_CONTEXT: &str = "NativeTextField";
 
 fn register_menus(
     cx: &mut App,
@@ -137,12 +233,20 @@ fn register_menus(
         KeyBinding::new("cmd-h", Hide, None),
         KeyBinding::new("alt-cmd-h", HideOthers, None),
         KeyBinding::new("cmd-w", CloseWindow, None),
+        KeyBinding::new("cmd-x", Cut, Some(NATIVE_TEXT_CONTEXT)),
+        KeyBinding::new("cmd-c", Copy, Some(NATIVE_TEXT_CONTEXT)),
+        KeyBinding::new("cmd-v", Paste, Some(NATIVE_TEXT_CONTEXT)),
+        KeyBinding::new("cmd-a", SelectAll, Some(NATIVE_TEXT_CONTEXT)),
     ]);
     cx.on_action(|_: &Quit, cx| cx.quit());
     cx.on_action(|_: &Hide, cx| cx.hide());
     cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
     cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
-    cx.on_action(|_: &CloseWindow, cx| cx.hide());
+    cx.on_action(move |_: &CloseWindow, cx| {
+        cx.defer(move |cx| {
+            let _ = main_window.update(cx, |_, window, cx| dismiss_main_window(window, cx));
+        });
+    });
     let window_to_minimize = main_window;
     cx.on_action(move |_: &Minimize, cx| {
         cx.defer(move |cx| {
@@ -170,7 +274,14 @@ fn register_menus(
             MenuItem::separator(),
             MenuItem::action("Quit Pyzhscriber", Quit),
         ]),
+        Menu::new("Edit").items([
+            MenuItem::os_action("Cut", Cut, OsAction::Cut),
+            MenuItem::os_action("Copy", Copy, OsAction::Copy),
+            MenuItem::os_action("Paste", Paste, OsAction::Paste),
+            MenuItem::os_action("Select All", SelectAll, OsAction::SelectAll),
+        ]),
         Menu::new("Window").items([
+            MenuItem::action("Close Window", CloseWindow),
             MenuItem::action("Minimize", Minimize),
             MenuItem::action("Zoom", Zoom),
         ]),

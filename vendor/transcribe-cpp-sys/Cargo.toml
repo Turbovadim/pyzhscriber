@@ -13,13 +13,14 @@
 edition = "2021"
 rust-version = "1.74"
 name = "transcribe-cpp-sys"
-version = "0.2.2"
+version = "0.4.1"
 build = "bindings/rust/sys/build.rs"
 links = "transcribe"
 include = [
     "/CMakeLists.txt",
     "/CMakePresets.json",
     "/LICENSE",
+    "/THIRD-PARTY-LICENSES.md",
     "/include/**/*.h",
     "/include/transcribe.abihash",
     "/src/**",

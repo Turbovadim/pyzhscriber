@@ -1,5 +1,7 @@
 # Whisper inference performance
 
+> **Since the 0.4.1 merge (November 2026):** these measurements were taken against the 0.2.2 engine. Upstream 0.4.1 added its own read-only weight mapping (`transcribe-mmap.cpp`, `load_common::WeightStorage`), which replaced the local mapping helper described here, including for the Core ML decoder-only path and its encoder fallback. Over 100 local recordings, the merged engine's Whisper and Canary output matched unmodified 0.4.1 exactly. The remaining local changes kept Whisper about 5% and Canary about 9% faster than unmodified 0.4.1.
+
 The Whisper optimizations preserve the installed model weights, encoder precision, decoding thresholds, temperature fallback, language constraints, and timestamp rules. They remove redundant computation and temporary storage in the vendored `transcribe-cpp-sys` engine.
 
 - The mel frontend skips FFT/filterbank work only when every windowed input is exactly zero and the filterbank is finite. It retains the original normalization over the complete recording.

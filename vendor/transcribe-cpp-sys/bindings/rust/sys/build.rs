@@ -1,11 +1,17 @@
 //! Build script for `transcribe-cpp-sys`.
 //!
-//! Source build is the primary (and currently only) path: the `cmake` crate
-//! drives the vendored C++ tree with `TRANSCRIBE_INSTALL=ON`, and the link
-//! line is reconstructed from NOTHING but the installed
-//! `lib/transcribe-link.json` manifest — the same artifact the `link_smoke`
-//! CI lane compiles a toy C consumer against. No per-platform link lists are
-//! hardcoded here (the whisper-rs drift class this avoids).
+//! Source build is the primary path: the `cmake` crate drives the vendored
+//! C++ tree with `TRANSCRIBE_INSTALL=ON`, and the link line is reconstructed
+//! from NOTHING but the installed `lib/transcribe-link.json` manifest — the
+//! same artifact the `link_smoke` CI lane compiles a toy C consumer against.
+//! No per-platform link lists are hardcoded here (the whisper-rs drift class
+//! this avoids).
+//!
+//! Prebuilt path: setting TRANSCRIBE_DIR (OPENSSL_DIR-style) to an install
+//! prefix produced by `cmake --install` of a TRANSCRIBE_INSTALL=ON build
+//! skips the source build entirely and links against that prefix's manifest
+//! instead. Cargo features are inert there: the prebuilt already decided its
+//! configuration (static/shared, backends), and the manifest records it.
 //!
 //! Cargo features map directly to CMake options:
 //!   `shared`           -> TRANSCRIBE_BUILD_SHARED=ON (default: static)
@@ -16,6 +22,8 @@
 //!   `cuda`             -> TRANSCRIBE_CUDA=ON
 //!   `rocm`             -> TRANSCRIBE_HIP=ON
 //!   `openmp`           -> TRANSCRIBE_USE_OPENMP=ON
+//! macOS builds pin a portable CPU floor (GGML_NATIVE=OFF; x86_64 adds
+//! SSE4.2 + AVX + F16C); `TRANSCRIBE_CMAKE_ARGS=-DGGML_NATIVE=ON` overrides.
 //! Official-artifact hygiene flags (OpenMP/BLAS off) are deliberately NOT
 //! forced here: a source build is the consumer's build (same philosophy as
 //! the Python sdist).
@@ -82,6 +90,29 @@ fn main() {
         "bindings/rust/sys/src",
     ] {
         println!("cargo:rerun-if-changed={}", root.join(p).display());
+    }
+
+    // Prebuilt path: TRANSCRIBE_DIR points at an existing install prefix (a
+    // `cmake --install` tree from a TRANSCRIBE_INSTALL=ON configure). Skip the
+    // source build and emit the link line from that prefix's manifest; the
+    // manifest records the install's own posture (static/shared, backends), so
+    // the Cargo features below never apply here.
+    println!("cargo:rerun-if-env-changed=TRANSCRIBE_DIR");
+    if let Some(dir) = env::var_os("TRANSCRIBE_DIR") {
+        let prefix = PathBuf::from(dir);
+        let manifest = find_manifest(&prefix).unwrap_or_else(|| {
+            panic!(
+                "TRANSCRIBE_DIR is set but no lib/transcribe-link.json (or lib64/) exists \
+                 under {}. It must point at an install prefix of this library, produced by \
+                 `cmake -B build -DTRANSCRIBE_INSTALL=ON && cmake --build build && \
+                 cmake --install build --prefix <dir>`. Unset TRANSCRIBE_DIR to build \
+                 the vendored sources instead.",
+                prefix.display()
+            )
+        });
+        println!("cargo:rerun-if-changed={}", manifest.display());
+        emit_link_lines(&prefix, &manifest);
+        return;
     }
 
     // `dynamic-backends` (loadable backend modules) requires a shared library,
@@ -153,6 +184,24 @@ fn main() {
             cfg.define("GGML_METAL_EMBED_LIBRARY", "ON");
         } else {
             cfg.define("TRANSCRIBE_METAL", "OFF");
+        }
+    }
+    // macOS CPU floor: never tune to the build host. An M2+ native build SIGILLs
+    // on M1 and compiles out llamafile sgemm (1.2-2.1x slower). x86_64 pins the
+    // macOS 10.15 ISA floor; a dynamic-backends build picks ISA at runtime.
+    if target_os == "macos" {
+        cfg.define("GGML_NATIVE", "OFF");
+        if target_arch == "x86_64" && !dynamic_backends {
+            for (opt, value) in [
+                ("GGML_SSE42", "ON"),
+                ("GGML_AVX", "ON"),
+                ("GGML_F16C", "ON"),
+                ("GGML_AVX2", "OFF"),
+                ("GGML_FMA", "OFF"),
+                ("GGML_BMI2", "OFF"),
+            ] {
+                cfg.define(opt, value);
+            }
         }
     }
     if feature("VULKAN") {
@@ -525,6 +574,4 @@ fn stage_windows_dlls(prefix: &Path) {
             }
         }
     }
-    // Re-stage when the built DLLs change.
-    println!("cargo:rerun-if-changed={}", bin_dir.display());
 }

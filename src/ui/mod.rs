@@ -8,13 +8,13 @@ use crate::models::{
     supports_russian,
 };
 use crate::permissions::{self, PermissionStatus, PermissionStatuses};
-use crate::settings::{AppSettings, PasteMethod, RouteSetting, TranscriptionMode};
+use crate::settings::{AppSettings, CloudProvider, PasteMethod, RouteSetting, TranscriptionMode};
 use crate::theme;
 use gpui::{
-    AnimationExt, AnyElement, Bounds, Context, CursorStyle, FocusHandle, FontWeight, Hsla,
+    AnimationExt, AnyElement, App, Bounds, Context, CursorStyle, FocusHandle, FontWeight, Hsla,
     KeyDownEvent, MouseButton, Path, Pixels, Render, SharedString, Size, SpringAnimation,
     SpringConfig, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind,
-    WindowOptions, canvas, deferred, div, point, prelude::*, px, size, svg,
+    WindowOptions, canvas, deferred, div, point, prelude::*, px, relative, size, svg,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -85,6 +85,7 @@ pub struct RootView {
     shortcut_capture: ShortcutCapture,
     /// History entry whose text was just copied, cleared after a short delay.
     copied_entry: Option<i64>,
+    cli_install_result: Option<Result<String, String>>,
     /// Models tab filters. The catalog runs to dozens of entries, most of which
     /// are irrelevant to any one user, so the list is narrowed before display.
     model_search: String,
@@ -92,6 +93,13 @@ pub struct RootView {
     model_language: ModelLanguage,
     model_streaming_only: bool,
     model_translate_only: bool,
+    /// Query typed into whichever searchable dropdown is open.
+    dropdown_search: String,
+    dropdown_search_focus: FocusHandle,
+    /// OpenRouter's transcription models, fetched the first time its model
+    /// menu opens. Until then the built-in suggestions are shown.
+    openrouter_models: Option<Vec<crate::cloud::CloudModel>>,
+    openrouter_fetching: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -156,7 +164,7 @@ impl RootView {
                             this.history.truncate(this.settings.history_limit);
                         }
                         RuntimeEvent::Settings(settings) => {
-                            this.settings = settings;
+                            this.settings = *settings;
                             this.sync_overlay(cx);
                         }
                         RuntimeEvent::DownloadProgress { model_id, progress } => {
@@ -165,6 +173,9 @@ impl RootView {
                             } else {
                                 this.downloads.insert(model_id, progress);
                             }
+                        }
+                        RuntimeEvent::DownloadStopped { model_id } => {
+                            this.downloads.remove(&model_id);
                         }
                         RuntimeEvent::ModelsChanged(models) => this.models = models,
                         RuntimeEvent::ShortcutCapture(capture) => this.shortcut_capture = capture,
@@ -178,7 +189,7 @@ impl RootView {
         let settings = controller.settings();
         let status = controller.status();
         let permission_statuses = PermissionStatuses::current();
-        let models = controller.models.default_choices();
+        let models = controller.models.choices();
         let history = controller
             .history
             .recent(settings.history_limit)
@@ -200,11 +211,16 @@ impl RootView {
             permission_polling: false,
             shortcut_capture: ShortcutCapture::Idle,
             copied_entry: None,
+            cli_install_result: None,
             model_search: String::new(),
             model_search_focus: cx.focus_handle().tab_stop(true),
             model_language: ModelLanguage::Any,
             model_streaming_only: false,
             model_translate_only: false,
+            dropdown_search: String::new(),
+            dropdown_search_focus: cx.focus_handle(),
+            openrouter_models: None,
+            openrouter_fetching: false,
         }
     }
 
@@ -259,6 +275,46 @@ impl RootView {
         };
         self.open_dropdown = None;
         self.permission_setup_visible = false;
+        cx.notify();
+    }
+
+    #[cfg(feature = "visual-qa")]
+    pub(crate) fn prepare_qa_cloud(&mut self, cx: &mut Context<Self>) {
+        self.prepare_qa_general(cx);
+        self.shortcut_capture = ShortcutCapture::Idle;
+        self.settings.cloud_enabled = true;
+        self.settings.cloud_provider = CloudProvider::OpenRouter;
+        self.settings.cloud_accounts.insert(
+            CloudProvider::OpenRouter,
+            crate::settings::CloudAccount {
+                api_key: "qa".into(),
+                ..Default::default()
+            },
+        );
+        self.openrouter_models = Some(
+            [
+                ("openai/whisper-large-v3", "OpenAI: Whisper Large V3"),
+                (
+                    "openai/whisper-large-v3-turbo",
+                    "OpenAI: Whisper Large V3 Turbo",
+                ),
+                ("elevenlabs/scribe-v2", "ElevenLabs: Scribe v2"),
+            ]
+            .map(|(id, name)| crate::cloud::CloudModel {
+                id: id.into(),
+                name: name.into(),
+            })
+            .into(),
+        );
+        self.dropdown_search = "whisper".into();
+        self.open_dropdown = Some("cloud-model".into());
+        cx.notify();
+    }
+
+    #[cfg(feature = "visual-qa")]
+    pub(crate) fn prepare_qa_error(&mut self, cx: &mut Context<Self>) {
+        self.prepare_qa_page("models", cx);
+        self.status = RuntimeStatus::Error("Download failed: checksum mismatch".into());
         cx.notify();
     }
 
@@ -362,6 +418,9 @@ impl RootView {
                     is_resizable: false,
                     is_minimizable: false,
                     window_background: WindowBackgroundAppearance::Transparent,
+                    // The pill never becomes the active window, and GPUI caps
+                    // inactive windows at 30 fps unless told otherwise.
+                    inactive_frame_interval: None,
                     app_id: Some(env!("PYZHSCRIBER_BUNDLE_ID").into()),
                     ..Default::default()
                 },
@@ -369,7 +428,7 @@ impl RootView {
                     let controller = self.controller.clone();
                     move |window, cx| {
                         strip_window_chrome(window);
-                        cx.new(|cx| RecordingOverlay::new(controller.clone(), status, bubbly, cx))
+                        cx.new(|_| RecordingOverlay::new(controller.clone(), status, bubbly))
                     }
                 },
             )
@@ -426,6 +485,23 @@ impl RootView {
         .detach();
     }
 
+    /// Shows a native alert once the current event has been handled, then
+    /// applies its answer. NSAlert spins a nested run loop that keeps running
+    /// GPUI's queued tasks; called from an event handler, where app state is
+    /// still borrowed, those tasks panic and abort the app.
+    fn after_modal<T: 'static>(
+        cx: &mut Context<Self>,
+        ask: impl FnOnce() -> Option<T> + 'static,
+        apply: impl FnOnce(&mut Self, T, &mut Context<Self>) + 'static,
+    ) {
+        cx.spawn(async move |this, cx| {
+            if let Some(answer) = ask() {
+                this.update(cx, |this, cx| apply(this, answer, cx)).ok();
+            }
+        })
+        .detach();
+    }
+
     fn save(&mut self, mutate: impl FnOnce(&mut AppSettings), cx: &mut Context<Self>) {
         let mut settings = self.settings.clone();
         mutate(&mut settings);
@@ -455,142 +531,250 @@ impl RootView {
     where
         F: Fn(&mut Self, String, &mut Context<Self>) + 'static,
     {
-        let dropdown_id = id.into();
-        let id = dropdown_id.as_ref().to_string();
-        let is_open = self.open_dropdown.as_ref() == Some(&dropdown_id);
-        let current_label = options
+        self.select_with(id, options, selected_value, width, false, cx, on_select)
+    }
+
+    /// A select whose panel opens with a search field narrowing the options
+    /// by label or value.
+    fn searchable_select<F>(
+        &self,
+        id: impl Into<SharedString>,
+        options: Vec<SelectOption>,
+        selected_value: &str,
+        width: f32,
+        cx: &Context<Self>,
+        on_select: F,
+    ) -> AnyElement
+    where
+        F: Fn(&mut Self, String, &mut Context<Self>) + 'static,
+    {
+        self.select_with(id, options, selected_value, width, true, cx, on_select)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn select_with<F>(
+        &self,
+        id: impl Into<SharedString>,
+        options: Vec<SelectOption>,
+        selected_value: &str,
+        width: f32,
+        searchable: bool,
+        cx: &Context<Self>,
+        on_select: F,
+    ) -> AnyElement
+    where
+        F: Fn(&mut Self, String, &mut Context<Self>) + 'static,
+    {
+        let id = id.into();
+        let label = options
             .iter()
             .find(|option| option.value == selected_value)
-            .map(|option| option.label.clone())
-            .unwrap_or_else(|| selected_value.to_string());
-        let toggle_id = dropdown_id.clone();
-        let mut container = div().relative().w(px(width)).min_w(px(180.0)).child(
-            div()
-                .id(SharedString::from(format!("{id}-trigger")))
-                .h(px(34.0))
-                .w_full()
-                .px_3()
-                .rounded_md()
-                .border_1()
-                .border_color(if is_open {
-                    theme::accent()
-                } else {
-                    theme::border()
-                })
-                .bg(if is_open {
-                    theme::accent_dim()
-                } else {
-                    theme::input()
-                })
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap_3()
-                .text_sm()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(theme::text())
-                .hover(|style| style.border_color(theme::accent()).bg(theme::accent_dim()))
-                .cursor_pointer()
-                .child(div().flex_1().min_w_0().truncate().child(current_label))
-                .child(
-                    svg()
-                        .path(if is_open {
-                            "icons/chevron-up.svg"
-                        } else {
-                            "icons/chevron-down.svg"
-                        })
-                        .size(px(15.0))
-                        .text_color(theme::text()),
-                )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    if this.open_dropdown.as_ref() == Some(&toggle_id) {
-                        this.open_dropdown = None;
-                    } else {
-                        this.open_dropdown = Some(toggle_id.clone());
-                    }
-                    cx.notify();
-                })),
-        );
-
-        if is_open {
-            let mut panel = div()
-                .id(SharedString::from(format!("{id}-panel")))
-                .absolute()
-                .top(px(38.0))
-                .left_0()
-                .w_full()
-                .max_h(px(250.0))
-                .overflow_y_scroll()
-                .py_1()
-                .rounded_md()
-                .border_1()
-                .border_color(theme::border())
-                .bg(theme::raised())
-                .occlude()
-                .on_mouse_move(|_, _, cx| cx.stop_propagation())
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_dropdown(cx)));
-
-            let on_select = std::rc::Rc::new(on_select);
-            for (index, option) in options.into_iter().enumerate() {
-                let selected = option.value == selected_value;
-                let value = option.value.clone();
-                let on_select = on_select.clone();
-                panel = panel.child(
-                    div()
-                        .id(SharedString::from(format!("{id}-option-{index}")))
-                        .min_h(px(34.0))
-                        .w_full()
-                        .px_3()
-                        .py_2()
-                        .text_sm()
-                        .text_color(if selected {
-                            theme::text()
-                        } else {
-                            theme::muted()
-                        })
-                        .bg(if selected {
-                            theme::accent_dim()
-                        } else {
-                            theme::raised()
-                        })
-                        .hover(move |style| {
-                            style
-                                .bg(if selected {
-                                    theme::accent_dim()
-                                } else {
-                                    theme::hover()
-                                })
-                                .text_color(theme::text())
-                        })
-                        .cursor_pointer()
-                        .child(
-                            div()
-                                .w_full()
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .gap_2()
-                                .child(option.label)
-                                .when(selected, |row| {
-                                    row.child(
-                                        svg()
-                                            .path("icons/check.svg")
-                                            .size(px(14.0))
-                                            .text_color(theme::accent()),
-                                    )
-                                }),
-                        )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
+            .map_or_else(|| selected_value.to_string(), |option| option.label.clone());
+        let on_select = std::rc::Rc::new(on_select);
+        let query = if searchable {
+            self.dropdown_search.as_str()
+        } else {
+            ""
+        };
+        self.dropdown(id.clone(), label, width, searchable, cx, || {
+            options
+                .into_iter()
+                .filter(|option| matches_query(&[&option.label, &option.value], query))
+                .enumerate()
+                .map(|(index, option)| {
+                    let on_select = on_select.clone();
+                    let value = option.value.clone();
+                    self.dropdown_option(
+                        format!("{id}-option-{index}"),
+                        option.label,
+                        option.value == selected_value,
+                        cx,
+                        move |this, cx| {
                             on_select(this, value.clone(), cx);
                             this.close_dropdown(cx);
-                        })),
-                );
-            }
-            container = container.child(deferred(panel).with_priority(20));
-        }
-        container.into_any_element()
+                        },
+                    )
+                })
+                .collect()
+        })
+    }
+
+    /// A trigger that toggles `open_dropdown`, with its option panel built only
+    /// while open and deferred so it paints above later rows.
+    fn dropdown(
+        &self,
+        id: SharedString,
+        label: impl Into<SharedString>,
+        width: f32,
+        searchable: bool,
+        cx: &Context<Self>,
+        options: impl FnOnce() -> Vec<AnyElement>,
+    ) -> AnyElement {
+        let is_open = self.open_dropdown.as_ref() == Some(&id);
+        let toggle_id = id.clone();
+        div()
+            .relative()
+            .w(px(width))
+            .min_w(px(180.0))
+            .child(
+                div()
+                    .id(SharedString::from(format!("{id}-trigger")))
+                    .h(px(34.0))
+                    .w_full()
+                    .px_3()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(if is_open {
+                        theme::accent()
+                    } else {
+                        theme::border()
+                    })
+                    .bg(if is_open {
+                        theme::accent_dim()
+                    } else {
+                        theme::input()
+                    })
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::text())
+                    .hover(|style| style.border_color(theme::accent()).bg(theme::accent_dim()))
+                    .cursor_pointer()
+                    .child(div().flex_1().min_w_0().truncate().child(label.into()))
+                    .child(
+                        svg()
+                            .path(if is_open {
+                                "icons/chevron-up.svg"
+                            } else {
+                                "icons/chevron-down.svg"
+                            })
+                            .size(px(15.0))
+                            .flex_shrink_0()
+                            .text_color(theme::text()),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if this.open_dropdown.as_ref() == Some(&toggle_id) {
+                            this.open_dropdown = None;
+                        } else {
+                            this.open_dropdown = Some(toggle_id.clone());
+                            this.dropdown_search.clear();
+                            if searchable {
+                                this.dropdown_search_focus.focus(window, cx);
+                            }
+                            if toggle_id == "cloud-model" {
+                                this.fetch_openrouter_models(cx);
+                            }
+                        }
+                        cx.notify();
+                    })),
+            )
+            .when(is_open, |container| {
+                container.child(
+                    deferred(
+                        div()
+                            .id(SharedString::from(format!("{id}-panel")))
+                            .absolute()
+                            .top(px(38.0))
+                            .left_0()
+                            .w_full()
+                            .flex()
+                            .flex_col()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(theme::border())
+                            .bg(theme::raised())
+                            .shadow_lg()
+                            .occlude()
+                            .on_mouse_move(|_, _, cx| cx.stop_propagation())
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_mouse_down_out(
+                                cx.listener(|this, _, _, cx| this.close_dropdown(cx)),
+                            )
+                            .when(searchable, |panel| {
+                                panel.child(div().p_1().child(self.search_field(
+                                    SharedString::from(format!("{id}-search")),
+                                    "Search or type a model id",
+                                    &self.dropdown_search,
+                                    &self.dropdown_search_focus,
+                                    |this| &mut this.dropdown_search,
+                                    cx,
+                                )))
+                            })
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("{id}-options")))
+                                    .max_h(px(250.0))
+                                    .overflow_y_scroll()
+                                    .py_1()
+                                    .children(options()),
+                            ),
+                    )
+                    .with_priority(20),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn dropdown_option<F>(
+        &self,
+        id: impl Into<SharedString>,
+        label: impl Into<SharedString>,
+        checked: bool,
+        cx: &Context<Self>,
+        on_click: F,
+    ) -> AnyElement
+    where
+        F: Fn(&mut Self, &mut Context<Self>) + 'static,
+    {
+        div()
+            .id(id.into())
+            .min_h(px(34.0))
+            .w_full()
+            .px_3()
+            .py_2()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .text_sm()
+            .text_color(if checked {
+                theme::text()
+            } else {
+                theme::muted()
+            })
+            .bg(if checked {
+                theme::accent_dim()
+            } else {
+                theme::raised()
+            })
+            .hover(move |style| {
+                style
+                    .bg(if checked {
+                        theme::accent_dim()
+                    } else {
+                        theme::hover()
+                    })
+                    .text_color(theme::text())
+            })
+            .cursor_pointer()
+            .child(label.into())
+            .when(checked, |row| {
+                row.child(
+                    svg()
+                        .path("icons/check.svg")
+                        .size(px(14.0))
+                        .flex_shrink_0()
+                        .text_color(theme::accent()),
+                )
+            })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                on_click(this, cx);
+            }))
+            .into_any_element()
     }
 
     fn control_row(&self, label: &'static str, control: AnyElement) -> AnyElement {
@@ -922,6 +1106,8 @@ impl RootView {
             .child(label)
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.page = page;
+                // Picks up models added or removed outside the app.
+                this.models = this.controller.models.choices();
                 cx.notify();
             }))
             .into_any_element()
@@ -947,7 +1133,7 @@ impl RootView {
             .into_any_element()
     }
 
-    fn page_header(&self, title: &'static str, detail: impl Into<SharedString>) -> AnyElement {
+    fn page_header(&self, title: &'static str, detail: Option<SharedString>) -> AnyElement {
         div()
             .w_full()
             .pb_3()
@@ -962,13 +1148,15 @@ impl RootView {
                     .text_color(theme::text())
                     .child(title),
             )
-            .child(
-                div()
-                    .pb_1()
-                    .text_xs()
-                    .text_color(theme::muted())
-                    .child(detail.into()),
-            )
+            .when_some(detail, |header, detail| {
+                header.child(
+                    div()
+                        .pb_1()
+                        .text_xs()
+                        .text_color(theme::muted())
+                        .child(detail),
+                )
+            })
             .into_any_element()
     }
 
@@ -983,12 +1171,15 @@ impl RootView {
             .gap_4()
             .child(
                 div()
+                    .flex_shrink_0()
                     .text_sm()
                     .text_color(theme::text())
                     .child(label.into()),
             )
             .child(
                 div()
+                    .min_w_0()
+                    .truncate()
                     .text_sm()
                     .text_color(theme::muted())
                     .child(value.into()),
@@ -1001,6 +1192,22 @@ impl RootView {
         id: impl Into<SharedString>,
         label: impl Into<SharedString>,
         value: impl Into<SharedString>,
+        cx: &Context<Self>,
+        on_click: F,
+    ) -> AnyElement
+    where
+        F: Fn(&mut Self, &mut Context<Self>) + 'static,
+    {
+        self.tinted_action_row(id, label, value, theme::accent(), cx, on_click)
+    }
+
+    /// An action row whose value is tinted, e.g. danger for destructive actions.
+    fn tinted_action_row<F>(
+        &self,
+        id: impl Into<SharedString>,
+        label: impl Into<SharedString>,
+        value: impl Into<SharedString>,
+        tint: Hsla,
         cx: &Context<Self>,
         on_click: F,
     ) -> AnyElement
@@ -1021,14 +1228,17 @@ impl RootView {
             .cursor_pointer()
             .child(
                 div()
+                    .flex_shrink_0()
                     .text_sm()
                     .text_color(theme::text())
                     .child(label.into()),
             )
             .child(
                 div()
+                    .min_w_0()
+                    .truncate()
                     .text_sm()
-                    .text_color(theme::accent())
+                    .text_color(tint)
                     .child(value.into()),
             )
             .on_click(cx.listener(move |this, _, _, cx| on_click(this, cx)))
@@ -1053,13 +1263,161 @@ impl RootView {
         self.controller.models.model_name(id)
     }
 
-    fn model_options(&self, language: Option<&str>) -> Vec<SelectOption> {
-        self.models
+    /// Installed models for a language, plus `current` when it is not
+    /// installed, so the trigger shows its name instead of a raw catalog id.
+    fn model_options(&self, language: Option<&str>, current: &str) -> Vec<SelectOption> {
+        let mut options = self
+            .models
             .iter()
             .filter(|model| model.installed)
             .filter(|model| language.is_none_or(|language| supports_language(model, language)))
             .map(|model| SelectOption::new(model.id.clone(), model.name.clone()))
-            .collect()
+            .collect::<Vec<_>>();
+        if !options.iter().any(|option| option.value == current) {
+            options.insert(0, SelectOption::new(current, self.model_name(current)));
+        }
+        options
+    }
+
+    /// Starts a download unless one is already running for this model.
+    fn download_model(&mut self, model_id: String, cx: &mut Context<Self>) {
+        if self.downloads.contains_key(&model_id) {
+            return;
+        }
+        self.downloads.insert(model_id.clone(), 0.0);
+        self.controller.download_model(model_id);
+        cx.notify();
+    }
+
+    /// "Installed" with a delete action for models in our own folder; models
+    /// found in a shared Hugging Face cache are left for their owner to manage.
+    fn installed_status(&self, model: &ModelChoice, cx: &Context<Self>) -> AnyElement {
+        let id = model.id.clone();
+        let name = model.name.clone();
+        div()
+            .h(px(32.0))
+            .flex()
+            .items_center()
+            .gap_3()
+            .text_xs()
+            .font_weight(FontWeight::SEMIBOLD)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .text_color(theme::success())
+                    .child(
+                        svg()
+                            .path("icons/circle-check.svg")
+                            .size(px(14.0))
+                            .text_color(theme::success()),
+                    )
+                    .child("Installed"),
+            )
+            .when(model.removable, |status| {
+                status.child(
+                    div()
+                        .id(SharedString::from(format!("delete-{id}")))
+                        .px_2()
+                        .h(px(28.0))
+                        .flex()
+                        .items_center()
+                        .rounded_md()
+                        .text_color(theme::muted())
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme::hover()).text_color(theme::danger()))
+                        .child("Delete")
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            let name = name.clone();
+                            let id = id.clone();
+                            Self::after_modal(
+                                cx,
+                                move || {
+                                    dialogs::confirm(
+                                        &format!("Delete {name}?"),
+                                        "You can download it again later.",
+                                        "Delete",
+                                    )
+                                    .then_some(())
+                                },
+                                move |this, (), cx| {
+                                    if let Err(error) = this.controller.remove_model(&id) {
+                                        this.status = RuntimeStatus::Error(format!("{error:#}"));
+                                    }
+                                    this.models = this.controller.models.choices();
+                                    cx.notify();
+                                },
+                            );
+                        })),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// Download button for a catalog model: resumes an interrupted download,
+    /// and shows progress with a cancel while one runs. `None` once the model
+    /// is installed or when the id is not in the catalog.
+    fn download_button(
+        &self,
+        model_id: &str,
+        with_size: bool,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let model = self.models.iter().find(|model| model.id == model_id)?;
+        if model.installed {
+            return None;
+        }
+        let progress = self.downloads.get(model_id).copied();
+        let label = match progress {
+            Some(progress) => format!("{:.0}%", progress * 100.0),
+            None if model.partial_bytes > 0 => format!(
+                "Resume {:.0}%",
+                model.partial_bytes as f64 / model.size_bytes as f64 * 100.0
+            ),
+            None if with_size => format!("Download {}", display_size(model.size_bytes)),
+            None => "Download".to_string(),
+        };
+        let id = model.id.clone();
+        Some(
+            div()
+                .id(SharedString::from(format!("download-{model_id}")))
+                .flex_shrink_0()
+                .min_w(px(80.0))
+                .h(px(32.0))
+                .px_3()
+                .rounded_md()
+                .border_1()
+                .border_color(theme::accent())
+                .bg(theme::accent_dim())
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme::text())
+                .cursor_pointer()
+                .hover(|style| style.bg(theme::hover()))
+                .child(label)
+                .when(progress.is_some(), |button| {
+                    button.child(
+                        svg()
+                            .path("icons/x.svg")
+                            .size(px(12.0))
+                            .text_color(theme::muted()),
+                    )
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    if this.downloads.contains_key(&id) {
+                        this.controller.cancel_download(&id);
+                    } else {
+                        this.download_model(id.clone(), cx);
+                    }
+                }))
+                .into_any_element(),
+        )
     }
 
     fn model_languages(&self, model_id: &str) -> Vec<String> {
@@ -1091,23 +1449,28 @@ impl RootView {
             .collect()
     }
 
-    fn add_route(&mut self, cx: &mut Context<Self>) {
+    /// The first unrouted language an installed model covers, with that model.
+    fn next_route(&self) -> Option<(String, String)> {
         let used = self
             .settings
             .routes
             .iter()
             .map(|route| route.language.as_str())
             .collect::<BTreeSet<_>>();
-        let Some((language, model)) = self.models.iter().find_map(|model| {
-            if !model.installed {
-                return None;
-            }
-            model
-                .languages
-                .iter()
-                .find(|language| !used.contains(language.as_str()))
-                .map(|language| (language.clone(), model.id.clone()))
-        }) else {
+        self.models
+            .iter()
+            .filter(|model| model.installed)
+            .find_map(|model| {
+                model
+                    .languages
+                    .iter()
+                    .find(|language| !used.contains(language.as_str()))
+                    .map(|language| (language.clone(), model.id.clone()))
+            })
+    }
+
+    fn add_route(&mut self, cx: &mut Context<Self>) {
+        let Some((language, model)) = self.next_route() else {
             return;
         };
         self.save(
@@ -1126,13 +1489,12 @@ impl RootView {
             .py_2()
             .flex()
             .items_center()
-            .justify_between()
             .gap_3()
             .child(self.select(
                 SharedString::from(format!("route-language-{index}")),
                 self.route_language_options(index),
                 &route.language,
-                150.0,
+                180.0,
                 cx,
                 move |this, value, cx| {
                     let current_model = this
@@ -1166,9 +1528,9 @@ impl RootView {
             ))
             .child(self.select(
                 SharedString::from(format!("route-model-{index}")),
-                self.model_options(Some(&language)),
+                self.model_options(Some(&language), &route.model),
                 &route.model,
-                300.0,
+                320.0,
                 cx,
                 move |this, value, cx| {
                     this.save(
@@ -1181,32 +1543,26 @@ impl RootView {
                     );
                 },
             ))
+            .child(div().flex_1())
+            .children(self.download_button(&route.model, true, cx))
             .child(
                 div()
                     .id(SharedString::from(format!("remove-route-{index}")))
+                    .flex_shrink_0()
                     .size(px(30.0))
                     .rounded_md()
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_color(if can_remove {
-                        theme::muted()
-                    } else {
-                        theme::border()
-                    })
-                    .child(
-                        svg()
-                            .path("icons/x.svg")
-                            .size(px(14.0))
-                            .text_color(if can_remove {
-                                theme::muted()
-                            } else {
-                                theme::border()
-                            }),
-                    )
                     .when(can_remove, |button| {
                         button
-                            .hover(|style| style.bg(theme::hover()).text_color(theme::danger()))
+                            .child(
+                                svg()
+                                    .path("icons/x.svg")
+                                    .size(px(14.0))
+                                    .text_color(theme::muted()),
+                            )
+                            .hover(|style| style.bg(theme::hover()))
                             .cursor_pointer()
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.save(
@@ -1222,9 +1578,7 @@ impl RootView {
     }
 
     fn language_limit_control(&self, cx: &Context<Self>) -> AnyElement {
-        let id = SharedString::from("single-languages");
-        let is_open = self.open_dropdown.as_ref() == Some(&id);
-        let supported = self.model_languages(&self.settings.selected_model);
+        let mut supported = self.model_languages(&self.settings.selected_model);
         let selected = self
             .settings
             .allowed_languages
@@ -1235,95 +1589,32 @@ impl RootView {
         let label = match selected.as_slice() {
             [] => "All supported".to_string(),
             [language] => language_label(language),
-            languages => format!("{} selected", languages.len()),
+            languages => languages
+                .iter()
+                .map(|language| language.to_uppercase())
+                .collect::<Vec<_>>()
+                .join(", "),
         };
-        let toggle_id = id.clone();
-        let mut control = div().relative().w(px(300.0)).min_w(px(180.0)).child(
-            div()
-                .id("single-languages-trigger")
-                .h(px(34.0))
-                .w_full()
-                .px_3()
-                .rounded_md()
-                .border_1()
-                .border_color(if is_open {
-                    theme::accent()
-                } else {
-                    theme::border()
-                })
-                .bg(if is_open {
-                    theme::accent_dim()
-                } else {
-                    theme::input()
-                })
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap_3()
-                .text_sm()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(theme::text())
-                .hover(|style| style.border_color(theme::accent()).bg(theme::accent_dim()))
-                .cursor_pointer()
-                .child(div().flex_1().min_w_0().truncate().child(label))
-                .child(
-                    svg()
-                        .path(if is_open {
-                            "icons/chevron-up.svg"
-                        } else {
-                            "icons/chevron-down.svg"
-                        })
-                        .size(px(15.0)),
-                )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    if this.open_dropdown.as_ref() == Some(&toggle_id) {
-                        this.open_dropdown = None;
-                    } else {
-                        this.open_dropdown = Some(toggle_id.clone());
-                    }
-                    cx.notify();
-                })),
-        );
-
-        if is_open {
-            let mut panel = div()
-                .id("single-languages-panel")
-                .absolute()
-                .top(px(38.0))
-                .left_0()
-                .w_full()
-                .max_h(px(250.0))
-                .overflow_y_scroll()
-                .py_1()
-                .rounded_md()
-                .border_1()
-                .border_color(theme::border())
-                .bg(theme::raised())
-                .occlude()
-                .on_mouse_move(|_, _, cx| cx.stop_propagation())
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_dropdown(cx)));
-
-            let all_selected = selected.is_empty();
-            panel = panel.child(self.language_limit_option(
-                "all",
+        // Picked languages float to the top so a long list still shows them.
+        supported.sort_by_key(|language| !selected.contains(language));
+        self.dropdown("single-languages".into(), label, 300.0, false, cx, || {
+            let mut options = vec![self.dropdown_option(
+                "single-language-all",
                 "All supported",
-                all_selected,
+                selected.is_empty(),
                 cx,
-                |this, cx| {
-                    this.save(|settings| settings.allowed_languages.clear(), cx);
-                },
-            ));
-            for language in supported {
+                |this, cx| this.save(|settings| settings.allowed_languages.clear(), cx),
+            )];
+            options.extend(supported.into_iter().map(|language| {
                 let checked = selected.contains(&language);
-                let option_language = language.clone();
-                panel = panel.child(self.language_limit_option(
-                    &language,
-                    &language_label(&language),
+                let label = language_label(&language);
+                self.dropdown_option(
+                    format!("single-language-{language}"),
+                    label,
                     checked,
                     cx,
                     move |this, cx| {
-                        let language = option_language.clone();
+                        let language = language.clone();
                         this.save(
                             |settings| {
                                 if let Some(index) = settings
@@ -1339,68 +1630,10 @@ impl RootView {
                             cx,
                         );
                     },
-                ));
-            }
-            control = control.child(deferred(panel).with_priority(20));
-        }
-        control.into_any_element()
-    }
-
-    fn language_limit_option<F>(
-        &self,
-        id: &str,
-        label: &str,
-        checked: bool,
-        cx: &Context<Self>,
-        on_click: F,
-    ) -> AnyElement
-    where
-        F: Fn(&mut Self, &mut Context<Self>) + 'static,
-    {
-        div()
-            .id(SharedString::from(format!("single-language-{id}")))
-            .min_h(px(34.0))
-            .w_full()
-            .px_3()
-            .py_2()
-            .flex()
-            .items_center()
-            .justify_between()
-            .text_sm()
-            .text_color(if checked {
-                theme::text()
-            } else {
-                theme::muted()
-            })
-            .bg(if checked {
-                theme::accent_dim()
-            } else {
-                theme::raised()
-            })
-            .hover(move |style| {
-                style
-                    .bg(if checked {
-                        theme::accent_dim()
-                    } else {
-                        theme::hover()
-                    })
-                    .text_color(theme::text())
-            })
-            .cursor_pointer()
-            .child(label.to_string())
-            .when(checked, |row| {
-                row.child(
-                    svg()
-                        .path("icons/check.svg")
-                        .size(px(14.0))
-                        .text_color(theme::accent()),
                 )
-            })
-            .on_click(cx.listener(move |this, _, _, cx| {
-                cx.stop_propagation();
-                on_click(this, cx);
-            }))
-            .into_any_element()
+            }));
+            options
+        })
     }
 
     fn mode_control(&self, cx: &Context<Self>) -> AnyElement {
@@ -1566,6 +1799,32 @@ impl RootView {
             .into_any_element()
     }
 
+    fn permission_rows(&self, cx: &Context<Self>) -> Vec<AnyElement> {
+        vec![
+            self.permission_row(
+                PermissionKind::Microphone,
+                "Microphone",
+                "Records only while your transcription shortcut is active",
+                self.permission_statuses.microphone,
+                cx,
+            ),
+            self.permission_row(
+                PermissionKind::Accessibility,
+                "Accessibility",
+                "Inserts the finished transcript into the active app",
+                self.permission_statuses.accessibility,
+                cx,
+            ),
+            self.permission_row(
+                PermissionKind::InputMonitoring,
+                "Input Monitoring",
+                "Detects your shortcut while other apps are active",
+                self.permission_statuses.input_monitoring,
+                cx,
+            ),
+        ]
+    }
+
     fn render_permission_setup(&self, cx: &Context<Self>) -> AnyElement {
         let all_granted = self.permission_statuses.all_granted();
         div()
@@ -1614,29 +1873,7 @@ impl RootView {
                                     .child("Pyzhscriber needs these macOS permissions to record speech and insert the transcript."),
                             ),
                     )
-                    .child(framed(vec![
-                        self.permission_row(
-                            PermissionKind::Microphone,
-                            "Microphone",
-                            "Records only while your transcription shortcut is active",
-                            self.permission_statuses.microphone,
-                            cx,
-                        ),
-                        self.permission_row(
-                            PermissionKind::Accessibility,
-                            "Accessibility",
-                            "Inserts the finished transcript into the active app",
-                            self.permission_statuses.accessibility,
-                            cx,
-                        ),
-                        self.permission_row(
-                            PermissionKind::InputMonitoring,
-                            "Input Monitoring",
-                            "Detects your shortcut while other apps are active",
-                            self.permission_statuses.input_monitoring,
-                            cx,
-                        ),
-                    ]))
+                    .child(framed(self.permission_rows(cx)))
                     .child(
                         div()
                             .text_xs()
@@ -1653,24 +1890,16 @@ impl RootView {
 
     fn render_general(&self, cx: &Context<Self>) -> AnyElement {
         let recording = self.status == RuntimeStatus::Recording;
-        let status_detail = match &self.status {
-            RuntimeStatus::Error(error) => error.clone(),
-            _ => self.status.label().to_string(),
-        };
         div()
             .flex()
             .flex_col()
-            .child(self.page_header("General", status_detail.clone()))
+            .child(self.page_header("General", None))
             .child(self.section("Transcription", {
                 let mut rows = vec![
                     self.action_row(
                         "toggle-recording",
-                        if recording {
-                            "Stop recording"
-                        } else {
-                            "Start recording"
-                        },
-                        status_detail,
+                        "Manual recording",
+                        if recording { "Stop" } else { "Start" },
                         cx,
                         |this, _| this.controller.toggle_recording(),
                     ),
@@ -1684,7 +1913,7 @@ impl RootView {
                             .enumerate()
                             .map(|(index, route)| self.route_row(index, route, cx)),
                     );
-                    rows.push(
+                    rows.extend(self.next_route().is_some().then(|| {
                         div()
                             .id("add-route")
                             .w_full()
@@ -1699,31 +1928,40 @@ impl RootView {
                             .cursor_pointer()
                             .child("+ Add language")
                             .on_click(cx.listener(|this, _, _, cx| this.add_route(cx)))
-                            .into_any_element(),
-                    );
+                            .into_any_element()
+                    }));
                 } else {
-                    rows.push(self.control_row(
-                        "Model",
-                        self.select(
-                            "single-model",
-                            self.model_options(None),
-                            &self.settings.selected_model,
-                            340.0,
-                            cx,
-                            |this, value, cx| {
-                                let supported = this.model_languages(&value);
-                                this.save(
-                                    |settings| {
-                                        settings.selected_model = value;
-                                        settings
-                                            .allowed_languages
-                                            .retain(|language| supported.contains(language));
-                                    },
+                    let selected_model = &self.settings.selected_model;
+                    rows.push(
+                        self.control_row(
+                            "Model",
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_3()
+                                .children(self.download_button(selected_model, true, cx))
+                                .child(self.select(
+                                    "single-model",
+                                    self.model_options(None, selected_model),
+                                    selected_model,
+                                    340.0,
                                     cx,
-                                );
-                            },
+                                    |this, value, cx| {
+                                        let supported = this.model_languages(&value);
+                                        this.save(
+                                            |settings| {
+                                                settings.selected_model = value;
+                                                settings.allowed_languages.retain(|language| {
+                                                    supported.contains(language)
+                                                });
+                                            },
+                                            cx,
+                                        );
+                                    },
+                                ))
+                                .into_any_element(),
                         ),
-                    ));
+                    );
                     if self.model_languages(&self.settings.selected_model).len() > 1 {
                         rows.push(self.detailed_control_row(
                             "Languages",
@@ -1791,33 +2029,221 @@ impl RootView {
                 }
                 rows
             }))
+            .child(self.section("Cloud", self.cloud_rows(cx)))
             .child(self.section(
                 "Permissions",
-                vec![
-                    self.permission_row(
-                        PermissionKind::Microphone,
-                        "Microphone",
-                        "Records only while your transcription shortcut is active",
-                        self.permission_statuses.microphone,
-                        cx,
-                    ),
-                    self.permission_row(
-                        PermissionKind::Accessibility,
-                        "Accessibility",
-                        "Inserts the finished transcript into the active app",
-                        self.permission_statuses.accessibility,
-                        cx,
-                    ),
-                    self.permission_row(
-                        PermissionKind::InputMonitoring,
-                        "Input Monitoring",
-                        "Detects your shortcut while other apps are active",
-                        self.permission_statuses.input_monitoring,
-                        cx,
-                    ),
-                ],
+                if self.permission_statuses.all_granted() {
+                    vec![self.row("All granted", "Microphone, Accessibility, Input Monitoring")]
+                } else {
+                    self.permission_rows(cx)
+                },
             ))
             .into_any_element()
+    }
+
+    fn cloud_rows(&self, cx: &Context<Self>) -> Vec<AnyElement> {
+        let enabled = self.settings.cloud_enabled;
+        let provider = self.settings.cloud_provider;
+        let mut rows = vec![
+            self.detailed_control_row(
+                "Cloud dictation",
+                Some(
+                    if enabled {
+                        let delivery = if crate::cloud::streams(&self.settings) {
+                            "streams to"
+                        } else {
+                            "is sent to"
+                        };
+                        format!(
+                            "Audio {delivery} {}. Local models step in if it fails.",
+                            provider.label()
+                        )
+                    } else {
+                        "Use a paid provider instead of local models".to_string()
+                    }
+                    .into(),
+                ),
+                self.switch("cloud-enabled", enabled, cx, |settings, value| {
+                    settings.cloud_enabled = value;
+                }),
+            ),
+        ];
+        if !enabled {
+            return rows;
+        }
+        let account = self
+            .settings
+            .cloud_accounts
+            .get(&provider)
+            .cloned()
+            .unwrap_or_default();
+
+        rows.push(
+            self.control_row(
+                "Provider",
+                self.select(
+                    "cloud-provider",
+                    CloudProvider::ALL
+                        .iter()
+                        .map(|provider| {
+                            SelectOption::new(format!("{provider:?}"), provider.label())
+                        })
+                        .collect(),
+                    &format!("{provider:?}"),
+                    260.0,
+                    cx,
+                    |this, value, cx| {
+                        if let Some(provider) = CloudProvider::ALL
+                            .into_iter()
+                            .find(|provider| format!("{provider:?}") == value)
+                        {
+                            this.save(|settings| settings.cloud_provider = provider, cx);
+                        }
+                    },
+                ),
+            ),
+        );
+
+        let model = crate::cloud::model(&self.settings);
+        let mut model_options = match &self.openrouter_models {
+            Some(models) if provider == CloudProvider::OpenRouter => models
+                .iter()
+                .map(|model| SelectOption::new(&model.id, &model.name))
+                .collect::<Vec<_>>(),
+            _ => provider
+                .models()
+                .iter()
+                .map(|model| {
+                    let label = if crate::cloud::is_streaming(provider, model) {
+                        format!("{model} · streaming")
+                    } else {
+                        model.to_string()
+                    };
+                    SelectOption::new(*model, label)
+                })
+                .collect(),
+        };
+        if !model_options.iter().any(|option| option.value == model) {
+            let label = if model.is_empty() {
+                "Not set"
+            } else {
+                model.as_str()
+            };
+            model_options.insert(0, SelectOption::new(model.clone(), label));
+        }
+        let typed = self.dropdown_search.trim();
+        if !typed.is_empty() && !model_options.iter().any(|option| option.value == typed) {
+            model_options.push(SelectOption::new(
+                typed,
+                format!("Use \u{201c}{typed}\u{201d}"),
+            ));
+        }
+        rows.push(self.control_row(
+            "Model",
+            self.searchable_select(
+                "cloud-model",
+                model_options,
+                &model,
+                260.0,
+                cx,
+                move |this, value, cx| {
+                    this.save(
+                        |settings| {
+                            settings.cloud_accounts.entry(provider).or_default().model = value;
+                        },
+                        cx,
+                    );
+                },
+            ),
+        ));
+
+        rows.push(self.action_row(
+            "cloud-key",
+            "API key",
+            if account.api_key.is_empty() {
+                "Not set"
+            } else {
+                "Saved"
+            },
+            cx,
+            move |this, cx| {
+                let current = this
+                    .settings
+                    .cloud_accounts
+                    .get(&provider)
+                    .map(|account| account.api_key.clone())
+                    .unwrap_or_default();
+                let detail = match provider.key_page() {
+                    Some(page) => {
+                        format!("Create one at {page}. Saved locally in Pyzhscriber settings.")
+                    }
+                    None => "Saved locally in Pyzhscriber settings.".to_string(),
+                };
+                Self::after_modal(
+                    cx,
+                    move || {
+                        dialogs::prompt("API key", &detail, &current, true)
+                            .map(|value| value.trim().to_string())
+                            .filter(|value| !value.is_empty())
+                    },
+                    move |this, value, cx| {
+                        this.save(
+                            |settings| {
+                                settings.cloud_accounts.entry(provider).or_default().api_key =
+                                    value;
+                            },
+                            cx,
+                        );
+                    },
+                );
+            },
+        ));
+
+        if provider == CloudProvider::Custom {
+            rows.push(self.action_row(
+                "cloud-url",
+                "Server URL",
+                if account.base_url.is_empty() {
+                    "Not set".to_string()
+                } else {
+                    account.base_url.clone()
+                },
+                cx,
+                move |this, cx| {
+                    let current = this
+                        .settings
+                        .cloud_accounts
+                        .get(&provider)
+                        .map(|account| account.base_url.clone())
+                        .unwrap_or_default();
+                    Self::after_modal(
+                        cx,
+                        move || {
+                            dialogs::prompt(
+                                "Server URL",
+                                "OpenAI-compatible base URL, e.g. http://localhost:8000/v1",
+                                &current,
+                                false,
+                            )
+                            .map(|value| value.trim().to_string())
+                        },
+                        move |this, value, cx| {
+                            this.save(
+                                |settings| {
+                                    settings
+                                        .cloud_accounts
+                                        .entry(provider)
+                                        .or_default()
+                                        .base_url = value;
+                                },
+                                cx,
+                            );
+                        },
+                    );
+                },
+            ));
+        }
+        rows
     }
 
     /// One icon-only filter toggle, tinted while it is narrowing the list.
@@ -1877,65 +2303,30 @@ impl RootView {
             .into_any_element()
     }
 
-    fn on_model_search_key_down(
-        &mut self,
-        event: &KeyDownEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let keystroke = &event.keystroke;
-        let handled = match keystroke.key.as_str() {
-            "backspace" | "delete" => {
-                self.model_search.pop();
-                true
-            }
-            "escape" => {
-                self.model_search.clear();
-                true
-            }
-            "v" if keystroke.modifiers.secondary() => {
-                if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                    self.model_search
-                        .push_str(&text.replace(['\n', '\r', '\t'], " "));
-                }
-                true
-            }
-            _ if !keystroke.modifiers.control
-                && !keystroke.modifiers.platform
-                && !keystroke.modifiers.function =>
-            {
-                if let Some(text) = &keystroke.key_char {
-                    self.model_search
-                        .push_str(&text.replace(['\n', '\r', '\t'], " "));
-                    true
-                } else {
-                    false
-                }
-            }
-            _ => false,
-        };
-
-        if handled {
-            cx.stop_propagation();
-            cx.notify();
-        }
-    }
-
-    fn model_search(&self, cx: &Context<Self>) -> AnyElement {
-        let empty = self.model_search.is_empty();
+    /// A one-line text field editing the string `field` points at. Keys are
+    /// handled by hand since GPUI ships no text input.
+    fn search_field(
+        &self,
+        id: SharedString,
+        placeholder: &'static str,
+        value: &str,
+        focus: &FocusHandle,
+        field: fn(&mut Self) -> &mut String,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let empty = value.is_empty();
         let text = if empty {
-            SharedString::from("Search name or description")
+            SharedString::from(placeholder)
         } else {
-            SharedString::from(self.model_search.clone())
+            SharedString::from(value.to_string())
         };
+        let focus_on_click = focus.clone();
 
         div()
-            .id("model-search")
-            .key_context("ModelSearch")
-            .track_focus(&self.model_search_focus)
+            .id(id.clone())
+            .track_focus(focus)
             .h(px(34.0))
-            .w(px(280.0))
-            .min_w(px(220.0))
+            .w_full()
             .px_3()
             .rounded_md()
             .border_1()
@@ -1952,7 +2343,7 @@ impl RootView {
             .when(!empty, |input| {
                 input.child(
                     div()
-                        .id("clear-model-search")
+                        .id(SharedString::from(format!("{id}-clear")))
                         .size(px(20.0))
                         .flex()
                         .items_center()
@@ -1966,18 +2357,48 @@ impl RootView {
                                 .size(px(12.0))
                                 .text_color(theme::muted()),
                         )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.model_search.clear();
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            field(this).clear();
                             cx.stop_propagation();
                             cx.notify();
                         })),
                 )
             })
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.model_search_focus.focus(window, cx);
+            .on_click(cx.listener(move |_, _, window, cx| {
+                focus_on_click.focus(window, cx);
             }))
-            .on_key_down(cx.listener(Self::on_model_search_key_down))
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                if edit_query(field(this), event, cx) {
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
             .into_any_element()
+    }
+
+    /// Loads OpenRouter's model list once per session, while its menu is the
+    /// one being opened.
+    fn fetch_openrouter_models(&mut self, cx: &mut Context<Self>) {
+        if self.settings.cloud_provider != CloudProvider::OpenRouter
+            || self.openrouter_models.is_some()
+            || self.openrouter_fetching
+        {
+            return;
+        }
+        self.openrouter_fetching = true;
+        cx.spawn(async move |this, cx| {
+            let models = smol::unblock(crate::cloud::openrouter_models).await;
+            this.update(cx, |this, cx| {
+                this.openrouter_fetching = false;
+                match models {
+                    Ok(models) => this.openrouter_models = Some(models),
+                    Err(error) => log::warn!("OpenRouter model list: {error:#}"),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn render_models(&self, cx: &Context<Self>) -> AnyElement {
@@ -1995,6 +2416,7 @@ impl RootView {
             .partition(|model| model.installed || self.downloads.contains_key(&model.id));
         let total = self.models.len();
         let shown = matching.len();
+        let installed = self.models.iter().filter(|model| model.installed).count();
 
         let card = |model: &ModelChoice| {
             let languages = if model.languages.len() == 1 {
@@ -2002,19 +2424,7 @@ impl RootView {
             } else {
                 format!("{} languages", model.languages.len())
             };
-            let model_id = model.id.clone();
-            let installed = model.installed;
             let download_progress = self.downloads.get(&model.id).copied();
-            let status = download_progress.map_or_else(
-                || {
-                    if installed {
-                        "Installed".to_string()
-                    } else {
-                        "Download".to_string()
-                    }
-                },
-                |progress| format!("{:.0}%", progress * 100.0),
-            );
             div()
                 .id(SharedString::from(format!("model-{}", model.id)))
                 .w_full()
@@ -2073,7 +2483,7 @@ impl RootView {
                                     .child(
                                         div()
                                             .h_full()
-                                            .w(px(360.0 * progress.clamp(0.0, 1.0)))
+                                            .w(relative(progress.clamp(0.0, 1.0)))
                                             .rounded_full()
                                             .bg(theme::accent()),
                                     ),
@@ -2081,61 +2491,43 @@ impl RootView {
                         }),
                 )
                 .child(
-                    div()
-                        .mt_1()
-                        .min_w(px(80.0))
-                        .h(px(32.0))
-                        .px_3()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(if installed {
-                            theme::border()
-                        } else {
-                            theme::accent()
-                        })
-                        .bg(if installed {
-                            theme::input()
-                        } else {
-                            theme::accent_dim()
-                        })
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_xs()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(if installed {
-                            theme::success()
-                        } else {
-                            theme::text()
-                        })
-                        .child(status),
+                    div().mt_1().child(
+                        self.download_button(&model.id, false, cx)
+                            .unwrap_or_else(|| self.installed_status(model, cx)),
+                    ),
                 )
-                .when(!installed, |row| {
-                    row.cursor_pointer()
-                        .on_click(cx.listener(move |this, _, _, _| {
-                            this.controller.download_model(model_id.clone());
-                        }))
-                })
         };
 
         div()
             .flex()
             .flex_col()
-            .child(self.page_header(
-                "Models",
-                if shown == total {
-                    format!("{total} models in the shared cache")
-                } else {
-                    format!("{shown} of {total} models")
-                },
-            ))
+            .child(
+                self.page_header(
+                    "Models",
+                    Some(
+                        if shown == total {
+                            format!("{installed} installed, {total} in catalog")
+                        } else {
+                            format!("{shown} of {total} shown")
+                        }
+                        .into(),
+                    ),
+                ),
+            )
             .child(
                 div()
                     .pb_1()
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(self.model_search(cx))
+                    .child(div().w(px(280.0)).min_w(px(220.0)).child(self.search_field(
+                        "model-search".into(),
+                        "Search name or description",
+                        &self.model_search,
+                        &self.model_search_focus,
+                        |this| &mut this.model_search,
+                        cx,
+                    )))
                     .child(self.filter_toggle(
                         "filter-streaming",
                         "icons/audio-lines.svg",
@@ -2236,7 +2628,7 @@ impl RootView {
         div()
             .flex()
             .flex_col()
-            .child(self.page_header("Audio", "16 kHz mono processing"))
+            .child(self.page_header("Audio", None))
             .child(self.section(
                 "Microphone",
                 vec![
@@ -2330,24 +2722,34 @@ impl RootView {
             self.action_row(
                 "custom-terms",
                 "Custom terms",
-                format!("{} terms", self.settings.custom_words.len()),
+                match self.settings.custom_words.len() {
+                    0 => "None".to_string(),
+                    1 => "1 term".to_string(),
+                    count => format!("{count} terms"),
+                },
                 cx,
                 |this, cx| {
                     let current = this.settings.custom_words.join(", ");
-                    if let Some(value) = dialogs::prompt(
-                        "Custom terms",
-                        "Comma or newline separated. Whisper uses these as an initial prompt.",
-                        &current,
-                        false,
-                    ) {
-                        let words = value
-                            .split([',', '\n'])
-                            .map(str::trim)
-                            .filter(|word| !word.is_empty())
-                            .map(str::to_string)
-                            .collect();
-                        this.save(|settings| settings.custom_words = words, cx);
-                    }
+                    Self::after_modal(
+                        cx,
+                        move || {
+                            dialogs::prompt(
+                                "Custom terms",
+                                "Comma or newline separated. Whisper uses these as an initial prompt.",
+                                &current,
+                                false,
+                            )
+                        },
+                        |this, value, cx| {
+                            let words = value
+                                .split([',', '\n'])
+                                .map(str::trim)
+                                .filter(|word| !word.is_empty())
+                                .map(str::to_string)
+                                .collect();
+                            this.save(|settings| settings.custom_words = words, cx);
+                        },
+                    );
                 },
             ),
             self.toggle_row(
@@ -2373,14 +2775,21 @@ impl RootView {
                     self.settings.post_process_base_url.clone(),
                     cx,
                     |this, cx| {
-                        if let Some(value) = dialogs::prompt(
-                            "AI endpoint",
-                            "OpenAI-compatible base URL",
-                            &this.settings.post_process_base_url,
-                            false,
-                        ) {
-                            this.save(|settings| settings.post_process_base_url = value, cx);
-                        }
+                        let current = this.settings.post_process_base_url.clone();
+                        Self::after_modal(
+                            cx,
+                            move || {
+                                dialogs::prompt(
+                                    "AI endpoint",
+                                    "OpenAI-compatible base URL",
+                                    &current,
+                                    false,
+                                )
+                            },
+                            |this, value, cx| {
+                                this.save(|settings| settings.post_process_base_url = value, cx);
+                            },
+                        );
                     },
                 ),
                 self.action_row(
@@ -2393,14 +2802,21 @@ impl RootView {
                     },
                     cx,
                     |this, cx| {
-                        if let Some(value) = dialogs::prompt(
-                            "AI model",
-                            "Model name exposed by the endpoint",
-                            &this.settings.post_process_model,
-                            false,
-                        ) {
-                            this.save(|settings| settings.post_process_model = value, cx);
-                        }
+                        let current = this.settings.post_process_model.clone();
+                        Self::after_modal(
+                            cx,
+                            move || {
+                                dialogs::prompt(
+                                    "AI model",
+                                    "Model name exposed by the endpoint",
+                                    &current,
+                                    false,
+                                )
+                            },
+                            |this, value, cx| {
+                                this.save(|settings| settings.post_process_model = value, cx);
+                            },
+                        );
                     },
                 ),
                 self.action_row(
@@ -2413,15 +2829,22 @@ impl RootView {
                     },
                     cx,
                     |this, cx| {
-                        if let Some(value) = dialogs::prompt(
-                            "API key",
-                            "Saved locally in Pyzhscriber settings.",
-                            &this.settings.post_process_api_key,
-                            true,
-                        ) && !value.is_empty()
-                        {
-                            this.save(|settings| settings.post_process_api_key = value, cx);
-                        }
+                        let current = this.settings.post_process_api_key.clone();
+                        Self::after_modal(
+                            cx,
+                            move || {
+                                dialogs::prompt(
+                                    "API key",
+                                    "Saved locally in Pyzhscriber settings.",
+                                    &current,
+                                    true,
+                                )
+                                .filter(|value| !value.is_empty())
+                            },
+                            |this, value, cx| {
+                                this.save(|settings| settings.post_process_api_key = value, cx);
+                            },
+                        );
                     },
                 ),
             ]);
@@ -2430,7 +2853,7 @@ impl RootView {
         div()
             .flex()
             .flex_col()
-            .child(self.page_header("Output", "Text insertion and cleanup"))
+            .child(self.page_header("Output", None))
             .child(self.section("Text", text_rows))
             .child(self.section("AI cleanup", cleanup_rows))
             .into_any_element()
@@ -2441,29 +2864,44 @@ impl RootView {
             return div()
                 .flex()
                 .flex_col()
-                .child(self.page_header("History", "Recent transcriptions"))
-                .child(self.section(
-                    "Transcriptions",
-                    vec![self.row("No transcriptions yet", "")],
-                ))
+                .child(self.page_header("History", None))
+                .child(
+                    div()
+                        .px_2()
+                        .py_4()
+                        .text_sm()
+                        .text_color(theme::muted())
+                        .child("No transcriptions yet."),
+                )
                 .into_any_element();
         }
-        let mut rows =
-            vec![
-                self.action_row(
-                    "clear-history",
-                    "Clear history",
-                    "Clear",
+        let mut rows = vec![self.tinted_action_row(
+            "clear-history",
+            "Clear history",
+            "Clear",
+            theme::danger(),
+            cx,
+            |_, cx| {
+                Self::after_modal(
                     cx,
-                    |this, cx| match this.controller.history.clear() {
-                        Ok(()) => {
-                            this.history.clear();
-                            cx.notify();
-                        }
-                        Err(error) => this.status = RuntimeStatus::Error(error.to_string()),
+                    || {
+                        dialogs::confirm(
+                            "Clear history?",
+                            "All transcriptions and their recordings will be deleted.",
+                            "Clear",
+                        )
+                        .then_some(())
                     },
-                ),
-            ];
+                    |this, (), cx| {
+                        match this.controller.history.clear() {
+                            Ok(()) => this.history.clear(),
+                            Err(error) => this.status = RuntimeStatus::Error(error.to_string()),
+                        }
+                        cx.notify();
+                    },
+                );
+            },
+        )];
         rows.extend(self.history.iter().map(|entry| {
             let text = entry.text.clone();
             let id = entry.id;
@@ -2493,10 +2931,7 @@ impl RootView {
                         .child(format!(
                             "{:.1}s  ·  {}",
                             entry.audio_seconds,
-                            entry
-                                .created_at
-                                .with_timezone(&chrono::Local)
-                                .format("%H:%M")
+                            history_time(entry.created_at)
                         ))
                         .child(if copied {
                             div()
@@ -2546,7 +2981,10 @@ impl RootView {
         div()
             .flex()
             .flex_col()
-            .child(self.page_header("History", "Recent transcriptions"))
+            .child(self.page_header(
+                "History",
+                Some(format!("{} entries", self.history.len()).into()),
+            ))
             .child(self.section("Transcriptions", rows))
             .into_any_element()
     }
@@ -2564,16 +3002,45 @@ impl RootView {
         div()
             .flex()
             .flex_col()
-            .child(self.page_header("Advanced", "Runtime and startup"))
-            .child(self.section(
-                "Runtime",
-                vec![
+            .child(self.page_header("Advanced", None))
+            .child(self.section("Command line", {
+                let mut rows = vec![self.action_row(
+                    "install-cli",
+                    "Use Pyzhscriber in your terminal",
+                    "Install CLI",
+                    cx,
+                    |this, cx| {
+                        this.cli_install_result = Some(
+                            crate::cli_install::install().map_err(|error| format!("{error:#}")),
+                        );
+                        cx.notify();
+                    },
+                )];
+                if let Some(result) = &self.cli_install_result {
+                    let (message, color) = match result {
+                        Ok(message) => (message.clone(), theme::muted()),
+                        Err(error) => (error.clone(), theme::danger()),
+                    };
+                    rows.push(
+                        div()
+                            .px_4()
+                            .py_3()
+                            .text_xs()
+                            .text_color(color)
+                            .child(message)
+                            .into_any_element(),
+                    );
+                }
+                rows
+            }))
+            .child(self.section("Runtime", {
+                let loaded = self.controller.loaded_model_id();
+                let mut rows = vec![
                     self.row(
                         "Loaded model",
-                        self.controller
-                            .loaded_model_id()
-                            .map(|id| self.model_name(&id))
-                            .unwrap_or_else(|| "None".into()),
+                        loaded
+                            .as_deref()
+                            .map_or_else(|| "None".into(), |id| self.model_name(id)),
                     ),
                     self.control_row(
                         "Unload models after",
@@ -2591,26 +3058,27 @@ impl RootView {
                             cx,
                             |this, value, cx| {
                                 this.save(
-                                    |settings| {
-                                        settings.model_unload_minutes = value.parse().ok()
-                                    },
+                                    |settings| settings.model_unload_minutes = value.parse().ok(),
                                     cx,
                                 );
                             },
                         ),
                     ),
-                    self.action_row(
+                ];
+                if loaded.is_some() {
+                    rows.push(self.action_row(
                         "unload-model",
-                        "Unload current model now",
+                        "Free model memory now",
                         "Unload",
                         cx,
                         |this, cx| {
                             this.controller.unload_model();
                             cx.notify();
                         },
-                    ),
-                ],
-            ))
+                    ));
+                }
+                rows
+            }))
             .child(self.section(
                 "History",
                 vec![
@@ -2710,7 +3178,6 @@ impl RootView {
 const OVERLAY_ENTER: f32 = 0.26;
 const OVERLAY_LEAVE: f32 = 0.16;
 const OVERLAY_SETTLE: f32 = 0.14;
-const OVERLAY_FRAME: Duration = Duration::from_millis(16);
 const OVERLAY_PILL_WIDTH: f32 = 148.0;
 const OVERLAY_PILL_HEIGHT: f32 = 42.0;
 const OVERLAY_WINDOW_WIDTH: f32 = 196.0;
@@ -2773,17 +3240,7 @@ impl RecordingOverlay {
         controller: Arc<AppController>,
         status: RuntimeStatus,
         bubbly: bool,
-        cx: &mut Context<Self>,
     ) -> Self {
-        cx.spawn(async move |this, cx| {
-            loop {
-                smol::Timer::after(OVERLAY_FRAME).await;
-                if this.update(cx, |_, cx| cx.notify()).is_err() {
-                    break;
-                }
-            }
-        })
-        .detach();
         let now = Instant::now();
         Self {
             status,
@@ -2951,7 +3408,10 @@ struct Shape {
 }
 
 impl Render for RecordingOverlay {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        // Redraws on every display refresh, so the motion runs at the
+        // screen's own rate instead of a fixed timer's.
+        window.request_animation_frame();
         let presence = self.presence();
         let age = self.opened.elapsed().as_secs_f32();
         let leaving = self.leaving.map(|start| start.elapsed().as_secs_f32());
@@ -3126,9 +3586,8 @@ impl Render for RecordingOverlay {
 /// side. The tips are true semicircles, exactly as with `rounded_full`; what
 /// changes is the junction with the flat edges, where a short easing curve
 /// takes the curvature from zero up to the arc's instead of switching to it
-/// abruptly. The outline is all quadratic curves because that is the only
-/// geometry GPUI anti-aliases; the long edges bow outward by half a pixel for
-/// the same reason.
+/// abruptly. The caps are quadratic curves, which GPUI anti-aliases; the long
+/// edges are straight lines.
 fn squircle(bounds: Bounds<Pixels>, inset: f32) -> Path<Pixels> {
     /// Where the easing hands over to the circular arc, measured from the
     /// top of the cap. Larger means a longer, more visible blend.
@@ -3139,7 +3598,7 @@ fn squircle(bounds: Bounds<Pixels>, inset: f32) -> Path<Pixels> {
     let width = f32::from(bounds.size.width) - inset * 2.0;
     let height = f32::from(bounds.size.height) - inset * 2.0;
     let r = height / 2.0;
-    let (right, bottom) = (left + width, top + height);
+    let right = left + width;
     let middle = top + r;
     let (sin, cos) = BLEND.sin_cos();
 
@@ -3189,19 +3648,15 @@ fn squircle(bounds: Bounds<Pixels>, inset: f32) -> Path<Pixels> {
         }
     };
 
+    // The outline must stay convex: any triangle that overlaps another shows
+    // as a darker patch as soon as the pill is translucent.
     let mut path = Path::new(cap(-1.0, -1.0, 0.0));
-    path.curve_to(
-        cap(1.0, -1.0, 0.0),
-        point(px((left + right) / 2.0), px(top - 1.0)),
-    );
+    path.line_to(cap(1.0, -1.0, 0.0));
     sweep(&mut path, 1.0, -1.0, 0.0, 0.5);
     sweep(&mut path, 1.0, -1.0, 0.5, 1.0);
     sweep(&mut path, 1.0, 1.0, 1.0, 0.5);
     sweep(&mut path, 1.0, 1.0, 0.5, 0.0);
-    path.curve_to(
-        cap(-1.0, 1.0, 0.0),
-        point(px((left + right) / 2.0), px(bottom + 1.0)),
-    );
+    path.line_to(cap(-1.0, 1.0, 0.0));
     sweep(&mut path, -1.0, 1.0, 0.0, 0.5);
     sweep(&mut path, -1.0, 1.0, 0.5, 1.0);
     sweep(&mut path, -1.0, -1.0, 1.0, 0.5);
@@ -3335,8 +3790,8 @@ impl Render for RootView {
                         cx,
                     ))
                     .child(self.sidebar_item(Page::Models, "Models", "icons/package.svg", cx))
-                    .child(self.sidebar_item(Page::Audio, "Audio", "icons/zap.svg", cx))
-                    .child(self.sidebar_item(Page::Output, "Output", "icons/copy.svg", cx))
+                    .child(self.sidebar_item(Page::Audio, "Audio", "icons/mic.svg", cx))
+                    .child(self.sidebar_item(Page::Output, "Output", "icons/type.svg", cx))
                     .child(self.sidebar_item(Page::History, "History", "icons/history.svg", cx))
                     .child(self.sidebar_item(Page::Advanced, "Advanced", "icons/settings.svg", cx))
                     .child(div().flex_1())
@@ -3351,13 +3806,13 @@ impl Render for RootView {
                             .gap_2()
                             .text_xs()
                             .text_color(theme::muted())
-                            .child(div().size(px(7.0)).rounded_full().bg(
-                                if matches!(self.status, RuntimeStatus::Error(_)) {
+                            .child(div().size(px(7.0)).rounded_full().bg(match self.status {
+                                RuntimeStatus::Idle => theme::success(),
+                                RuntimeStatus::Recording | RuntimeStatus::Error(_) => {
                                     theme::danger()
-                                } else {
-                                    theme::success()
-                                },
-                            ))
+                                }
+                                RuntimeStatus::Transcribing => theme::accent(),
+                            }))
                             .child(status_label),
                     ),
             )
@@ -3371,10 +3826,82 @@ impl Render for RootView {
                     .px(px(40.0))
                     .pb_8()
                     .overflow_y_scroll()
+                    .children(self.error_banner(cx))
                     .child(content),
             )
             .into_any_element()
     }
+}
+
+impl RootView {
+    /// The latest runtime error, shown above every page until dismissed, so a
+    /// failure (e.g. a model download) is visible wherever it happens.
+    fn error_banner(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let RuntimeStatus::Error(error) = &self.status else {
+            return None;
+        };
+        Some(
+            div()
+                .mb_4()
+                .px_4()
+                .py_3()
+                .rounded_lg()
+                .border_1()
+                .border_color(theme::danger())
+                .bg(theme::raised())
+                .flex()
+                .items_start()
+                .gap_3()
+                .text_sm()
+                .child(
+                    svg()
+                        .path("icons/circle-alert.svg")
+                        .mt(px(2.0))
+                        .size(px(16.0))
+                        .flex_shrink_0()
+                        .text_color(theme::danger()),
+                )
+                .child(div().flex_1().min_w_0().child(error.clone()))
+                .child(
+                    div()
+                        .id("dismiss-error")
+                        .flex_shrink_0()
+                        .size(px(20.0))
+                        .rounded_md()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme::hover()))
+                        .child(
+                            svg()
+                                .path("icons/x.svg")
+                                .size(px(12.0))
+                                .text_color(theme::muted()),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.status = RuntimeStatus::Idle;
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
+}
+
+/// Time of day for today's entries, with the date for anything older.
+fn history_time(created_at: chrono::DateTime<chrono::Utc>) -> String {
+    use chrono::Datelike;
+    let local = created_at.with_timezone(&chrono::Local);
+    let now = chrono::Local::now();
+    let format = if local.date_naive() == now.date_naive() {
+        "%H:%M"
+    } else if local.year() == now.year() {
+        "%b %-d, %H:%M"
+    } else {
+        "%b %-d %Y, %H:%M"
+    };
+    local.format(format).to_string()
 }
 
 fn paste_method_value(method: PasteMethod) -> &'static str {
@@ -3417,13 +3944,51 @@ fn model_metric(label: &'static str, score: f32) -> AnyElement {
 }
 
 fn model_matches_search(model: &ModelChoice, query: &str) -> bool {
-    let query = query.trim();
-    if query.is_empty() {
-        return true;
-    }
+    matches_query(&[&model.name, &model.description], query)
+}
 
-    let query = query.to_lowercase();
-    model.name.to_lowercase().contains(&query) || model.description.to_lowercase().contains(&query)
+/// Whether any of `fields` contains the query, ignoring case. An empty query
+/// matches everything.
+fn matches_query(fields: &[&str], query: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    query.is_empty()
+        || fields
+            .iter()
+            .any(|field| field.to_lowercase().contains(&query))
+}
+
+/// Applies a key press to a search query. Returns whether it was consumed.
+fn edit_query(query: &mut String, event: &KeyDownEvent, cx: &App) -> bool {
+    let keystroke = &event.keystroke;
+    match keystroke.key.as_str() {
+        "backspace" | "delete" => {
+            query.pop();
+            true
+        }
+        "escape" => {
+            query.clear();
+            true
+        }
+        "v" if keystroke.modifiers.secondary(cx) => {
+            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                query.push_str(&text.replace(['\n', '\r', '\t'], " "));
+            }
+            true
+        }
+        _ if !keystroke.modifiers.control
+            && !keystroke.modifiers.platform
+            && !keystroke.modifiers.function =>
+        {
+            match &keystroke.key_char {
+                Some(text) => {
+                    query.push_str(&text.replace(['\n', '\r', '\t'], " "));
+                    true
+                }
+                None => false,
+            }
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -3443,6 +4008,8 @@ mod tests {
             speed_score: 1.0,
             accuracy_score: 1.0,
             installed: false,
+            removable: false,
+            partial_bytes: 0,
             recommended: false,
             streaming: false,
             translate: false,

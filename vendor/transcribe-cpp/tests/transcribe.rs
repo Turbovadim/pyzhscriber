@@ -68,7 +68,7 @@ fn capabilities_and_identity() {
     let model = Model::load(&model_path).unwrap();
     assert_eq!(model.arch(), "whisper", "arch: {}", model.arch());
     assert!(model.backend().to_lowercase().contains("cpu") || !model.backend().is_empty());
-    let caps = model.capabilities();
+    let caps = model.capabilities().unwrap();
     assert!(caps.native_sample_rate > 0, "{caps:?}");
 }
 
@@ -128,9 +128,10 @@ fn itn_changes_sensevoice_text_normalization() {
     let enabled = run(&mut session, Itn::On);
     assert_eq!(
         (default.text, default.raw_text),
-        (disabled.text.clone(), disabled.raw_text.clone())
+        (enabled.text.clone(), enabled.raw_text.clone())
     );
     assert_ne!(enabled.text, disabled.text);
+    assert_eq!(disabled.text, disabled.text.to_lowercase());
     assert!(disabled.raw_text.contains("<|woitn|>"));
     assert!(enabled.raw_text.contains("<|withitn|>"));
 }
@@ -195,7 +196,7 @@ fn requested_timestamps_populate_rows() {
         return;
     };
     let model = Model::load(&model_path).unwrap();
-    let caps = model.capabilities();
+    let caps = model.capabilities().unwrap();
     // Request the finest granularity the model actually supports (a request
     // finer than max_timestamp_kind correctly returns Unsupported, status 12).
     if caps.max_timestamp_kind == TimestampKind::None {
@@ -227,7 +228,7 @@ fn timestamps_finer_than_supported_is_unsupported() {
         return;
     };
     let model = Model::load(&model_path).unwrap();
-    let caps = model.capabilities();
+    let caps = model.capabilities().unwrap();
     if caps.max_timestamp_kind == TimestampKind::Token {
         return; // already at the finest; nothing finer to ask for
     }
@@ -265,8 +266,8 @@ fn close_ordering_drop_model_before_session() {
 #[test]
 fn shared_model_across_threads_serializes() {
     // Model is Send+Sync; the per-model mutex serializes the compute path. Two
-    // threads each run on their own session of one shared model — they queue
-    // rather than race, and both succeed.
+    // threads each run (one as a batch) on their own session of one shared
+    // model — they queue rather than race (never Busy), and both succeed.
     let Some((model_path, pcm)) = common::smoke_fixtures("shared_model_across_threads_serializes")
     else {
         return;
@@ -274,12 +275,17 @@ fn shared_model_across_threads_serializes() {
     let model = Arc::new(Model::load(&model_path).unwrap());
     let pcm = Arc::new(pcm);
     let handles: Vec<_> = (0..2)
-        .map(|_| {
+        .map(|i| {
             let model = Arc::clone(&model);
             let pcm = Arc::clone(&pcm);
             thread::spawn(move || {
                 let mut s = model.session().unwrap();
-                s.run(&pcm, &RunOptions::default()).unwrap().text
+                let opts = RunOptions::default();
+                if i == 0 {
+                    s.run(&pcm, &opts).unwrap().text
+                } else {
+                    s.run_batch(&[&pcm], &opts).unwrap().remove(0).unwrap().text
+                }
             })
         })
         .collect();
