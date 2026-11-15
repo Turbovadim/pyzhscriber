@@ -26,9 +26,8 @@ cpal = "0.16"
 dirs = "6"
 enigo = "0.6.1"
 futures-util = { version = "0.3", features = ["sink"] }
-gpui = { git = "https://github.com/zed-industries/zed", rev = "b5cd310b3b54dfc659fcc06453e6358843dfe216", default-features = false, features = ["default"] }
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "b5cd310b3b54dfc659fcc06453e6358843dfe216", features = ["font-kit", "wayland", "x11"] }
-gpui_tokio = { git = "https://github.com/zed-industries/zed", rev = "b5cd310b3b54dfc659fcc06453e6358843dfe216" }
+gpui = { git = "https://github.com/Bisquit-Host/gpui-bisquit", rev = "9a8dc3e3b4f40e78f61ce36fca429e570828373a", default-features = false, features = ["default"] }
+gpui_platform = { git = "https://github.com/Bisquit-Host/gpui-bisquit", rev = "9a8dc3e3b4f40e78f61ce36fca429e570828373a", features = ["font-kit", "wayland", "x11"] }
 hound = "3.5"
 image = "0.25"
 log = "0.4"
@@ -62,12 +61,6 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = ["N
 # lands upstream in transcribe.cpp.
 transcribe-cpp = { path = "vendor/transcribe-cpp" }
 transcribe-cpp-sys = { path = "vendor/transcribe-cpp-sys" }
-
-[patch."https://github.com/zed-industries/zed"]
-# Release per-window Metal drawables and render targets after macOS reports
-# that a window has remained fully occluded for two seconds.
-gpui_apple = { path = "vendor/zed-gpui-occlusion/crates/gpui_apple" }
-gpui_macos = { path = "vendor/zed-gpui-occlusion/crates/gpui_macos" }
 
 [profile.release]
 opt-level = 3

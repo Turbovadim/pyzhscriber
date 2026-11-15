@@ -646,7 +646,7 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 [[package]]
 name = "bench_metrics"
 version = "0.1.0"
-source = "git+https://github.com/zed-industries/zed?rev=b5cd310b3b54dfc659fcc06453e6358843dfe216#b5cd310b3b54dfc659fcc06453e6358843dfe216"
+source = "git+https://github.com/Bisquit-Host/gpui-bisquit?rev=9a8dc3e3b4f40e78f61ce36fca429e570828373a#9a8dc3e3b4f40e78f61ce36fca429e570828373a"
 dependencies = [
  "anyhow",
  "criterion",
@@ -702,6 +702,12 @@ checksum = "7eff00be299a18769011411c9def0d827e8f2d7bf0c3dbf53633147a8867fd1f"
 dependencies = [
  "no_std_io2",
 ]
+
+[[package]]
+name = "block"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d8c1fef690941d3e7788d328517591fecc684c084084702d6ff1641e993699a"
 
 [[package]]
 name = "block-buffer"
@@ -907,6 +913,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "cbindgen"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eadd868a2ce9ca38de7eeafdcec9c7065ef89b42b32f0839278d55f35c54d1ff"
+dependencies = [
+ "heck 0.4.1",
+ "indexmap",
+ "log",
+ "proc-macro2",
+ "quote",
+ "serde",
+ "serde_json",
+ "syn 2.0.119",
+ "tempfile",
+ "toml 0.8.23",
+]
+
+[[package]]
 name = "cc"
 version = "1.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1068,6 +1092,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "cocoa"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6140449f97a6e97f9511815c5632d84c8aacf8ac271ad77c559218161a1373c"
+dependencies = [
+ "bitflags 1.3.2",
+ "block",
+ "cocoa-foundation",
+ "core-foundation 0.9.4",
+ "core-graphics 0.23.2",
+ "foreign-types 0.5.0",
+ "libc",
+ "objc",
+]
+
+[[package]]
+name = "cocoa-foundation"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c6234cbb2e4c785b456c0644748b1ac416dd045799740356f8363dfe00c93f7"
+dependencies = [
+ "bitflags 1.3.2",
+ "block",
+ "core-foundation 0.9.4",
+ "core-graphics-types 0.1.3",
+ "libc",
+ "objc",
+]
+
+[[package]]
 name = "codespan-reporting"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1081,7 +1135,7 @@ dependencies = [
 [[package]]
 name = "collections"
 version = "0.1.0"
-source = "git+https://github.com/zed-industries/zed?rev=b5cd310b3b54dfc659fcc06453e6358843dfe216#b5cd310b3b54dfc659fcc06453e6358843dfe216"
+source = "git+https://github.com/Bisquit-Host/gpui-bisquit?rev=9a8dc3e3b4f40e78f61ce36fca429e570828373a#9a8dc3e3b4f40e78f61ce36fca429e570828373a"
 dependencies = [
  "gpui_util",
  "indexmap",
@@ -1201,13 +1255,26 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "core-graphics"
+version = "0.23.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c07782be35f9e1140080c6b96f0d44b739e2278479f64e02fdab4e32dfd8b081"
+dependencies = [
+ "bitflags 1.3.2",
+ "core-foundation 0.9.4",
+ "core-graphics-types 0.1.3",
+ "foreign-types 0.5.0",
+ "libc",
+]
+
+[[package]]
+name = "core-graphics"
 version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fa95a34622365fa5bbf40b20b75dba8dfa8c94c734aea8ac9a5ca38af14316f1"
 dependencies = [
  "bitflags 2.13.1",
  "core-foundation 0.10.1",
- "core-graphics-types",
+ "core-graphics-types 0.2.0",
  "foreign-types 0.5.0",
  "libc",
 ]
@@ -1220,8 +1287,32 @@ checksum = "064badf302c3194842cf2c5d61f56cc88e54a759313879cdf03abdd27d0c3b97"
 dependencies = [
  "bitflags 2.13.1",
  "core-foundation 0.10.1",
- "core-graphics-types",
+ "core-graphics-types 0.2.0",
  "foreign-types 0.5.0",
+ "libc",
+]
+
+[[package]]
+name = "core-graphics-helmer-fork"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32eb7c354ae9f6d437a6039099ce7ecd049337a8109b23d73e48e8ffba8e9cd5"
+dependencies = [
+ "bitflags 2.13.1",
+ "core-foundation 0.9.4",
+ "core-graphics-types 0.1.3",
+ "foreign-types 0.5.0",
+ "libc",
+]
+
+[[package]]
+name = "core-graphics-types"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "45390e6114f68f718cc7a830514a96f903cccd70d02a8f6d9f643ac4ba45afaf"
+dependencies = [
+ "bitflags 1.3.2",
+ "core-foundation 0.9.4",
  "libc",
 ]
 
@@ -1516,7 +1607,7 @@ dependencies = [
 [[package]]
 name = "derive_refineable"
 version = "0.1.0"
-source = "git+https://github.com/zed-industries/zed?rev=b5cd310b3b54dfc659fcc06453e6358843dfe216#b5cd310b3b54dfc659fcc06453e6358843dfe216"
+source = "git+https://github.com/Bisquit-Host/gpui-bisquit?rev=9a8dc3e3b4f40e78f61ce36fca429e570828373a#9a8dc3e3b4f40e78f61ce36fca429e570828373a"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1565,6 +1656,12 @@ dependencies = [
  "redox_users",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "dispatch"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd0c93bb4b0c6d9b77f4435b0ae98c24d17f1c45b2ff844c6151a07256ca923b"
 
 [[package]]
 name = "dispatch2"
@@ -2444,7 +2541,7 @@ dependencies = [
 [[package]]
 name = "gpui"
 version = "0.2.2"
-source = "git+https://github.com/zed-industries/zed?rev=b5cd310b3b54dfc659fcc06453e6358843dfe216#b5cd310b3b54dfc659fcc06453e6358843dfe216"
+source = "git+https://github.com/Bisquit-Host/gpui-bisquit?rev=9a8dc3e3b4f40e78f61ce36fca429e570828373a#9a8dc3e3b4f40e78f61ce36fca429e570828373a"
 dependencies = [
  "accesskit",
  "anyhow",
@@ -2514,10 +2611,12 @@ dependencies = [
 [[package]]
 name = "gpui_apple"
 version = "0.1.0"
+source = "git+https://github.com/Bisquit-Host/gpui-bisquit?rev=9a8dc3e3b4f40e78f61ce36fca429e570828373a#9a8dc3e3b4f40e78f61ce36fca429e570828373a"
 dependencies = [
  "anyhow",
  "async-task",
  "block2 0.6.2",
+ "cbindgen",
  "collections",
  "core-foundation 0.10.1",
  "core-foundation-sys",
@@ -2551,7 +2650,7 @@ dependencies = [
 [[package]]
 name = "gpui_ios"
 version = "0.1.0"
-source = "git+https://github.com/zed-industries/zed?rev=b5cd310b3b54dfc659fcc06453e6358843dfe216#b5cd310b3b54dfc659fcc06453e6358843dfe216"
+source = "git+https://github.com/Bisquit-Host/gpui-bisquit?rev=9a8dc3e3b4f40e78f61ce36fca429e570828373a#9a8dc3e3b4f40e78f61ce36fca429e570828373a"
 dependencies = [
  "anyhow",
  "block2 0.6.2",
@@ -2572,7 +2671,7 @@ dependencies = [
 [[package]]
 name = "gpui_linux"
 version = "0.1.0"
-source = "git+https://github.com/zed-industries/zed?rev=b5cd310b3b54dfc659fcc06453e6358843dfe216#b5cd310b3b54dfc659fcc06453e6358843dfe216"
+source = "git+https://github.com/Bisquit-Host/gpui-bisquit?rev=9a8dc3e3b4f40e78f61ce36fca429e570828373a#9a8dc3e3b4f40e78f61ce36fca429e570828373a"
 dependencies = [
  "accesskit",
  "accesskit_unix",
@@ -2616,6 +2715,7 @@ dependencies = [
 [[package]]
 name = "gpui_macos"
 version = "0.1.0"
+source = "git+https://github.com/Bisquit-Host/gpui-bisquit?rev=9a8dc3e3b4f40e78f61ce36fca429e570828373a#9a8dc3e3b4f40e78f61ce36fca429e570828373a"
 dependencies = [
  "accesskit",
  "accesskit_macos",
@@ -2655,7 +2755,7 @@ dependencies = [
 [[package]]
 name = "gpui_macros"
 version = "0.1.0"
-source = "git+https://github.com/zed-industries/zed?rev=b5cd310b3b54dfc659fcc06453e6358843dfe216#b5cd310b3b54dfc659fcc06453e6358843dfe216"
+source = "git+https://github.com/Bisquit-Host/gpui-bisquit?rev=9a8dc3e3b4f40e78f61ce36fca429e570828373a#9a8dc3e3b4f40e78f61ce36fca429e570828373a"
 dependencies = [
  "heck 0.5.0",
  "proc-macro2",
@@ -2666,7 +2766,7 @@ dependencies = [
 [[package]]
 name = "gpui_platform"
 version = "0.1.0"
-source = "git+https://github.com/zed-industries/zed?rev=b5cd310b3b54dfc659fcc06453e6358843dfe216#b5cd310b3b54dfc659fcc06453e6358843dfe216"
+source = "git+https://github.com/Bisquit-Host/gpui-bisquit?rev=9a8dc3e3b4f40e78f61ce36fca429e570828373a#9a8dc3e3b4f40e78f61ce36fca429e570828373a"
 dependencies = [
  "anyhow",
  "console_error_panic_hook",
@@ -2682,7 +2782,7 @@ dependencies = [
 [[package]]
 name = "gpui_shared_string"
 version = "0.1.0"
-source = "git+https://github.com/zed-industries/zed?rev=b5cd310b3b54dfc659fcc06453e6358843dfe216#b5cd310b3b54dfc659fcc06453e6358843dfe216"
+source = "git+https://github.com/Bisquit-Host/gpui-bisquit?rev=9a8dc3e3b4f40e78f61ce36fca429e570828373a#9a8dc3e3b4f40e78f61ce36fca429e570828373a"
 dependencies = [
  "schemars",
  "serde",
@@ -2690,20 +2790,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "gpui_tokio"
-version = "0.1.0"
-source = "git+https://github.com/zed-industries/zed?rev=b5cd310b3b54dfc659fcc06453e6358843dfe216#b5cd310b3b54dfc659fcc06453e6358843dfe216"
-dependencies = [
- "anyhow",
- "gpui",
- "gpui_util",
- "tokio",
-]
-
-[[package]]
 name = "gpui_util"
 version = "0.1.0"
-source = "git+https://github.com/zed-industries/zed?rev=b5cd310b3b54dfc659fcc06453e6358843dfe216#b5cd310b3b54dfc659fcc06453e6358843dfe216"
+source = "git+https://github.com/Bisquit-Host/gpui-bisquit?rev=9a8dc3e3b4f40e78f61ce36fca429e570828373a#9a8dc3e3b4f40e78f61ce36fca429e570828373a"
 dependencies = [
  "anyhow",
  "log",
@@ -2713,7 +2802,7 @@ dependencies = [
 [[package]]
 name = "gpui_web"
 version = "0.1.0"
-source = "git+https://github.com/zed-industries/zed?rev=b5cd310b3b54dfc659fcc06453e6358843dfe216#b5cd310b3b54dfc659fcc06453e6358843dfe216"
+source = "git+https://github.com/Bisquit-Host/gpui-bisquit?rev=9a8dc3e3b4f40e78f61ce36fca429e570828373a#9a8dc3e3b4f40e78f61ce36fca429e570828373a"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -2742,7 +2831,7 @@ dependencies = [
 [[package]]
 name = "gpui_wgpu"
 version = "0.1.0"
-source = "git+https://github.com/zed-industries/zed?rev=b5cd310b3b54dfc659fcc06453e6358843dfe216#b5cd310b3b54dfc659fcc06453e6358843dfe216"
+source = "git+https://github.com/Bisquit-Host/gpui-bisquit?rev=9a8dc3e3b4f40e78f61ce36fca429e570828373a#9a8dc3e3b4f40e78f61ce36fca429e570828373a"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -2769,7 +2858,7 @@ dependencies = [
 [[package]]
 name = "gpui_windows"
 version = "0.1.0"
-source = "git+https://github.com/zed-industries/zed?rev=b5cd310b3b54dfc659fcc06453e6358843dfe216#b5cd310b3b54dfc659fcc06453e6358843dfe216"
+source = "git+https://github.com/Bisquit-Host/gpui-bisquit?rev=9a8dc3e3b4f40e78f61ce36fca429e570828373a#9a8dc3e3b4f40e78f61ce36fca429e570828373a"
 dependencies = [
  "accesskit",
  "accesskit_windows",
@@ -3038,7 +3127,7 @@ dependencies = [
 [[package]]
 name = "http_client"
 version = "0.1.0"
-source = "git+https://github.com/zed-industries/zed?rev=b5cd310b3b54dfc659fcc06453e6358843dfe216#b5cd310b3b54dfc659fcc06453e6358843dfe216"
+source = "git+https://github.com/Bisquit-Host/gpui-bisquit?rev=9a8dc3e3b4f40e78f61ce36fca429e570828373a#9a8dc3e3b4f40e78f61ce36fca429e570828373a"
 dependencies = [
  "anyhow",
  "bytes",
@@ -3845,6 +3934,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc04a4c58212d57930a24bf47d3fa87485264a3a054e9c10e042eb373573ad3c"
 
 [[package]]
+name = "malloc_buf"
+version = "0.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62bb907fe88d54d8d9ce32a3cceab4218ed2f6b7d35617cafe9adf84e43919cb"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "maybe-rayon"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4254,6 +4352,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "objc"
+version = "0.2.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "915b1b472bc21c53464d6c8461c9d3af805ba1ef837e1cac254428f4a77177b1"
+dependencies = [
+ "malloc_buf",
+ "objc_exception",
+]
+
+[[package]]
+name = "objc-foundation"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1add1b659e36c9607c7aab864a76c7a4c2760cd0cd2e120f3fb8b952c7e22bf9"
+dependencies = [
+ "block",
+ "objc",
+ "objc_id",
+]
+
+[[package]]
 name = "objc-sys"
 version = "0.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4560,6 +4679,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "objc_exception"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad970fb455818ad6cba4c122ad012fae53ae8b4795f86378bce65e4f6bab2ca4"
+dependencies = [
+ "cc",
+]
+
+[[package]]
+name = "objc_id"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c92d4ddb4bd7b50d730c215ff871754d0da6b2178849f8a2a2ab69712d0c073b"
+dependencies = [
+ "objc",
+]
+
+[[package]]
 name = "object"
 version = "0.37.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4592,7 +4729,8 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 [[package]]
 name = "oo7"
 version = "0.6.0"
-source = "git+https://github.com/zed-industries/oo7?rev=731c1215edb6905876c6137ab300428c7b8d7c13#731c1215edb6905876c6137ab300428c7b8d7c13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "78f2bfed90f1618b4b48dcad9307f25e14ae894e2949642c87c351601d62cebd"
 dependencies = [
  "aes",
  "ashpd",
@@ -5279,7 +5417,6 @@ dependencies = [
  "futures-util",
  "gpui",
  "gpui_platform",
- "gpui_tokio",
  "hound",
  "image",
  "libc",
@@ -5622,7 +5759,7 @@ dependencies = [
 [[package]]
 name = "refineable"
 version = "0.1.0"
-source = "git+https://github.com/zed-industries/zed?rev=b5cd310b3b54dfc659fcc06453e6358843dfe216#b5cd310b3b54dfc659fcc06453e6358843dfe216"
+source = "git+https://github.com/Bisquit-Host/gpui-bisquit?rev=9a8dc3e3b4f40e78f61ce36fca429e570828373a#9a8dc3e3b4f40e78f61ce36fca429e570828373a"
 dependencies = [
  "derive_refineable",
 ]
@@ -5923,7 +6060,7 @@ dependencies = [
 [[package]]
 name = "scheduler"
 version = "0.1.0"
-source = "git+https://github.com/zed-industries/zed?rev=b5cd310b3b54dfc659fcc06453e6358843dfe216#b5cd310b3b54dfc659fcc06453e6358843dfe216"
+source = "git+https://github.com/Bisquit-Host/gpui-bisquit?rev=9a8dc3e3b4f40e78f61ce36fca429e570828373a#9a8dc3e3b4f40e78f61ce36fca429e570828373a"
 dependencies = [
  "async-task",
  "backtrace",
@@ -5973,6 +6110,29 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
+name = "screencapturekit"
+version = "0.2.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a5eeeb57ac94960cfe5ff4c402be6585ae4c8d29a2cf41b276048c2e849d64e"
+dependencies = [
+ "screencapturekit-sys",
+]
+
+[[package]]
+name = "screencapturekit-sys"
+version = "0.2.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22411b57f7d49e7fe08025198813ee6fd65e1ee5eff4ebc7880c12c82bde4c60"
+dependencies = [
+ "block",
+ "dispatch",
+ "objc",
+ "objc-foundation",
+ "objc_id",
+ "once_cell",
+]
 
 [[package]]
 name = "seahash"
@@ -6373,7 +6533,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 [[package]]
 name = "sum_tree"
 version = "0.1.0"
-source = "git+https://github.com/zed-industries/zed?rev=b5cd310b3b54dfc659fcc06453e6358843dfe216#b5cd310b3b54dfc659fcc06453e6358843dfe216"
+source = "git+https://github.com/Bisquit-Host/gpui-bisquit?rev=9a8dc3e3b4f40e78f61ce36fca429e570828373a#9a8dc3e3b4f40e78f61ce36fca429e570828373a"
 dependencies = [
  "heapless",
  "rayon",
@@ -6684,6 +6844,18 @@ dependencies = [
  "serde",
  "slotmap",
  "smallvec",
+]
+
+[[package]]
+name = "tao-core-video-sys"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "271450eb289cb4d8d0720c6ce70c72c8c858c93dd61fc625881616752e6b98f6"
+dependencies = [
+ "cfg-if",
+ "core-foundation-sys",
+ "libc",
+ "objc",
 ]
 
 [[package]]
@@ -7020,6 +7192,7 @@ dependencies = [
  "serde",
  "serde_spanned 0.6.9",
  "toml_datetime 0.6.11",
+ "toml_write",
  "winnow 0.7.15",
 ]
 
@@ -7043,6 +7216,12 @@ checksum = "1d38ac1cf9b95face32296c0a3ede1fdc270627c9d9c02a7274dd6d960dc4d56"
 dependencies = [
  "winnow 1.0.4",
 ]
+
+[[package]]
+name = "toml_write"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
 name = "toml_writer"
@@ -8731,12 +8910,18 @@ dependencies = [
 [[package]]
 name = "zed-scap"
 version = "0.0.8-zed"
-source = "git+https://github.com/zed-industries/scap?rev=b5c86ec58dd4b6b7732bf6ac8be03d6b1f190a82#b5c86ec58dd4b6b7732bf6ac8be03d6b1f190a82"
+source = "git+https://github.com/zed-industries/scap?rev=4afea48c3b002197176fb19cd0f9b180dd36eaac#4afea48c3b002197176fb19cd0f9b180dd36eaac"
 dependencies = [
  "anyhow",
+ "cocoa",
+ "core-graphics-helmer-fork",
  "log",
+ "objc",
  "rand 0.8.8",
+ "screencapturekit",
+ "screencapturekit-sys",
  "sysinfo",
+ "tao-core-video-sys",
  "windows 0.61.3",
  "windows-capture",
  "x11",
@@ -8867,7 +9052,7 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 [[package]]
 name = "ztracing"
 version = "0.1.0"
-source = "git+https://github.com/zed-industries/zed?rev=b5cd310b3b54dfc659fcc06453e6358843dfe216#b5cd310b3b54dfc659fcc06453e6358843dfe216"
+source = "git+https://github.com/Bisquit-Host/gpui-bisquit?rev=9a8dc3e3b4f40e78f61ce36fca429e570828373a#9a8dc3e3b4f40e78f61ce36fca429e570828373a"
 dependencies = [
  "tracing",
  "ztracing_macro",
@@ -8876,7 +9061,7 @@ dependencies = [
 [[package]]
 name = "ztracing_macro"
 version = "0.1.0"
-source = "git+https://github.com/zed-industries/zed?rev=b5cd310b3b54dfc659fcc06453e6358843dfe216#b5cd310b3b54dfc659fcc06453e6358843dfe216"
+source = "git+https://github.com/Bisquit-Host/gpui-bisquit?rev=9a8dc3e3b4f40e78f61ce36fca429e570828373a#9a8dc3e3b4f40e78f61ce36fca429e570828373a"
 
 [[package]]
 name = "zune-core"

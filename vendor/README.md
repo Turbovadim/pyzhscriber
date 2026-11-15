@@ -8,8 +8,6 @@ Keep these directories in the repository. The root `Cargo.toml` uses them throug
 
 `transcribe-cpp/` and `transcribe-cpp-sys/` contain the published 0.4.1 crates with local extensions for constrained Whisper language detection, Core ML encoder support, Whisper and Canary inference optimizations, and loading pre-compiled ggml Metal libraries in the embedded build. Weight memory mapping is upstream's. Native sources, GGML, and their license files are included. See [Whisper inference performance](../docs/whisper-performance.md) for the optimizations and comparison tools.
 
-## GPUI macOS platform
+## GPUI
 
-`zed-gpui-occlusion/` contains patched `gpui_apple` and `gpui_macos` crates from Zed commit `b5cd310b3b54dfc659fcc06453e6358843dfe216`. The patch releases per-window Metal resources after a window has been fully occluded for two seconds.
-
-See its [README](zed-gpui-occlusion/README.md) for implementation details and standalone checks. The upstream Apache-2.0 license is included there.
+GPUI is not vendored. It comes from [gpui-bisquit](https://github.com/Bisquit-Host/gpui-bisquit), a fork of gpui-fast whose patches include releasing per-window Metal resources after a window has been fully occluded for two seconds.

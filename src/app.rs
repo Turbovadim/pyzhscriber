@@ -42,7 +42,6 @@ pub fn run() {
         }
     });
     application.run(move |cx: &mut App| {
-        gpui_tokio::init(cx);
         let controller_for_quit = controller.clone();
         cx.on_app_quit(move |_| {
             // Free native models synchronously: GPUI limits how long it waits

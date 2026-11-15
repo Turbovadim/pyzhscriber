@@ -32,7 +32,7 @@ From the project directory:
 cargo run --locked --bin pyzhscriber
 ```
 
-Keep `Cargo.lock` and `vendor/` in your checkout. Cargo uses local patches for transcribe.cpp and GPUI; these are required to build this version.
+Keep `Cargo.lock` and `vendor/` in your checkout. Cargo uses a local patch for transcribe.cpp, which is required to build this version. GPUI comes from the [gpui-bisquit](https://github.com/Bisquit-Host/gpui-bisquit) fork.
 
 ### First launch
 
@@ -153,4 +153,4 @@ See [vendor/README.md](vendor/README.md) for the native patches and their proven
 
 ## License
 
-Pyzhscriber is licensed under [MIT](LICENSE), with Handy's original copyright notice preserved. Vendored dependencies retain their own licenses, including the Apache-2.0 GPUI platform code. Model weights have their own licenses and are downloaded separately.
+Pyzhscriber is licensed under [MIT](LICENSE), with Handy's original copyright notice preserved. Vendored dependencies retain their own licenses. Model weights have their own licenses and are downloaded separately.
