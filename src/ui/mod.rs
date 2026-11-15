@@ -44,24 +44,18 @@ impl SelectOption {
     }
 }
 
-/// The shared frame around a group of settings rows. Separators are drawn by the
-/// frame rather than by each row, so the last row never rules a line across the
-/// rounded bottom edge, and clipping keeps row hover states inside the corners.
-/// Dropdown panels are `deferred`, which paints them outside this mask.
+/// A group of settings rows ruled by hairlines, with no frame around it.
 fn framed(children: Vec<AnyElement>) -> impl IntoElement {
     let last = children.len().saturating_sub(1);
     div()
         .w_full()
-        .rounded_lg()
-        .border_1()
-        .border_color(theme::border())
-        .bg(theme::raised())
-        .overflow_hidden()
+        .border_t_1()
+        .border_color(theme::separator())
         .children(children.into_iter().enumerate().map(|(index, child)| {
             div()
                 .w_full()
                 .when(index < last, |row| {
-                    row.border_b_1().border_color(theme::border())
+                    row.border_b_1().border_color(theme::separator())
                 })
                 .child(child)
         }))
@@ -619,18 +613,18 @@ impl RootView {
             .child(
                 div()
                     .id(SharedString::from(format!("{id}-trigger")))
-                    .h(px(34.0))
+                    .h(px(30.0))
                     .w_full()
-                    .px_3()
+                    .px_2p5()
                     .rounded_md()
                     .border_1()
                     .border_color(if is_open {
-                        theme::accent()
+                        theme::border_strong()
                     } else {
                         theme::border()
                     })
                     .bg(if is_open {
-                        theme::accent_dim()
+                        theme::hover()
                     } else {
                         theme::input()
                     })
@@ -639,9 +633,12 @@ impl RootView {
                     .justify_between()
                     .gap_3()
                     .text_sm()
-                    .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme::text())
-                    .hover(|style| style.border_color(theme::accent()).bg(theme::accent_dim()))
+                    .hover(|style| {
+                        style
+                            .border_color(theme::border_strong())
+                            .bg(theme::hover())
+                    })
                     .cursor_pointer()
                     .child(div().flex_1().min_w_0().truncate().child(label.into()))
                     .child(
@@ -651,9 +648,9 @@ impl RootView {
                             } else {
                                 "icons/chevron-down.svg"
                             })
-                            .size(px(15.0))
+                            .size(px(14.0))
                             .flex_shrink_0()
-                            .text_color(theme::text()),
+                            .text_color(theme::muted()),
                     )
                     .on_click(cx.listener(move |this, _, window, cx| {
                         if this.open_dropdown.as_ref() == Some(&toggle_id) {
@@ -677,7 +674,7 @@ impl RootView {
                         div()
                             .id(SharedString::from(format!("{id}-panel")))
                             .absolute()
-                            .top(px(38.0))
+                            .top(px(34.0))
                             .left_0()
                             .w_full()
                             .flex()
@@ -731,10 +728,10 @@ impl RootView {
     {
         div()
             .id(id.into())
-            .min_h(px(34.0))
+            .min_h(px(30.0))
             .w_full()
-            .px_3()
-            .py_2()
+            .px_2p5()
+            .py_1p5()
             .flex()
             .items_center()
             .justify_between()
@@ -745,20 +742,7 @@ impl RootView {
             } else {
                 theme::muted()
             })
-            .bg(if checked {
-                theme::accent_dim()
-            } else {
-                theme::raised()
-            })
-            .hover(move |style| {
-                style
-                    .bg(if checked {
-                        theme::accent_dim()
-                    } else {
-                        theme::hover()
-                    })
-                    .text_color(theme::text())
-            })
+            .hover(|style| style.bg(theme::hover()).text_color(theme::text()))
             .cursor_pointer()
             .child(label.into())
             .when(checked, |row| {
@@ -789,8 +773,8 @@ impl RootView {
     ) -> AnyElement {
         div()
             .w_full()
-            .min_h(px(52.0))
-            .px_4()
+            .min_h(px(44.0))
+            .px_3()
             .py_2()
             .flex()
             .items_center()
@@ -802,13 +786,7 @@ impl RootView {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme::text())
-                            .child(label),
-                    )
+                    .child(div().text_sm().text_color(theme::text()).child(label))
                     .when_some(detail, |column, detail| {
                         column.child(div().text_xs().text_color(theme::muted()).child(detail))
                     }),
@@ -837,9 +815,9 @@ impl RootView {
         };
         div()
             .id("shortcut-control")
-            .h(px(34.0))
-            .min_w(px(200.0))
-            .px_3()
+            .h(px(30.0))
+            .min_w(px(180.0))
+            .px_2p5()
             .rounded_md()
             .border_1()
             .border_color(if capturing {
@@ -857,11 +835,27 @@ impl RootView {
             .justify_between()
             .gap_4()
             .text_sm()
-            .font_weight(FontWeight::SEMIBOLD)
             .text_color(if muted { theme::muted() } else { theme::text() })
-            .hover(|style| style.border_color(theme::accent()).bg(theme::accent_dim()))
+            .hover(|style| {
+                style
+                    .border_color(theme::border_strong())
+                    .bg(theme::hover())
+            })
             .cursor_pointer()
-            .child(label)
+            .child(if muted {
+                div().child(label)
+            } else {
+                div()
+                    .px_1p5()
+                    .rounded_sm()
+                    .border_1()
+                    .border_b_2()
+                    .border_color(theme::border_strong())
+                    .bg(theme::selection())
+                    .text_xs()
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(label)
+            })
             .child(
                 div()
                     .text_xs()
@@ -967,7 +961,7 @@ impl RootView {
                             .w(px(160.0 * fraction))
                             .h(px(4.0))
                             .rounded_full()
-                            .bg(theme::accent()),
+                            .bg(theme::accent_gradient()),
                     )
                     .child(
                         div()
@@ -1020,18 +1014,18 @@ impl RootView {
         div()
             .id(id)
             .relative()
-            .w(px(42.0))
-            .h(px(24.0))
-            .p(px(3.0))
+            .w(px(36.0))
+            .h(px(20.0))
+            .p(px(2.0))
             .rounded_full()
             .bg(if enabled {
-                theme::accent()
+                theme::accent_gradient()
             } else {
-                theme::hover()
+                theme::hover().into()
             })
             .border_1()
             .border_color(if enabled {
-                theme::accent()
+                gpui::transparent_black()
             } else {
                 theme::border()
             })
@@ -1039,7 +1033,7 @@ impl RootView {
             .child(
                 div()
                     .relative()
-                    .size(px(16.0))
+                    .size(px(14.0))
                     .rounded_full()
                     .bg(if enabled {
                         theme::background()
@@ -1049,7 +1043,7 @@ impl RootView {
                     .with_spring(
                         SharedString::from(format!("{id}-thumb-spring")),
                         SpringAnimation::new(SpringConfig::new(520.0, 34.0, 1.0))
-                            .to(px(if enabled { 18.0 } else { 0.0 })),
+                            .to(px(if enabled { 16.0 } else { 0.0 })),
                         |thumb, left| thumb.left(left),
                     ),
             )
@@ -1069,7 +1063,7 @@ impl RootView {
         let selected = self.page == page;
         div()
             .id(SharedString::from(format!("nav-{page:?}")))
-            .h(px(36.0))
+            .h(px(30.0))
             .px_3()
             .mx_2()
             .rounded_md()
@@ -1077,32 +1071,35 @@ impl RootView {
             .items_center()
             .gap_2p5()
             .text_sm()
-            .font_weight(if selected {
-                FontWeight::SEMIBOLD
-            } else {
-                FontWeight::NORMAL
-            })
             .text_color(if selected {
                 theme::text()
             } else {
                 theme::muted()
             })
-            .bg(if selected {
-                theme::accent_dim()
-            } else {
-                theme::raised()
+            .relative()
+            .when(selected, |item| {
+                item.bg(theme::selection()).child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .top(px(8.0))
+                        .w(px(3.0))
+                        .h(px(14.0))
+                        .rounded_full()
+                        .bg(theme::accent()),
+                )
             })
             .hover(move |style| {
                 style
                     .bg(if selected {
-                        theme::accent_dim()
+                        theme::selection()
                     } else {
                         theme::hover()
                     })
                     .text_color(theme::text())
             })
             .cursor_pointer()
-            .child(svg().path(icon).size(px(16.0)).text_color(if selected {
+            .child(svg().path(icon).size(px(15.0)).text_color(if selected {
                 theme::accent()
             } else {
                 theme::muted()
@@ -1118,57 +1115,50 @@ impl RootView {
     }
 
     fn section(&self, title: &'static str, children: Vec<AnyElement>) -> AnyElement {
+        self.section_with(title, None, children)
+    }
+
+    /// A titled group of rows, with an optional control at the right of the title.
+    fn section_with(
+        &self,
+        title: &'static str,
+        trailing: Option<AnyElement>,
+        children: Vec<AnyElement>,
+    ) -> AnyElement {
         div()
             .w_full()
-            .pt_4()
-            .pb_2()
+            .pb_6()
             .flex()
             .flex_col()
-            .gap_2p5()
-            .child(
-                div()
-                    .px_2()
-                    .text_xs()
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(theme::muted())
-                    .child(title),
-            )
+            .child(self.section_title(title, trailing))
             .child(framed(children))
             .into_any_element()
     }
 
-    fn page_header(&self, title: &'static str, detail: Option<SharedString>) -> AnyElement {
+    fn section_title(&self, title: &'static str, trailing: Option<AnyElement>) -> AnyElement {
         div()
-            .w_full()
-            .pb_3()
+            .h(px(36.0))
+            .px_3()
             .flex()
-            .items_end()
+            .items_center()
             .justify_between()
-            .gap_6()
+            .gap_4()
             .child(
                 div()
-                    .text_2xl()
-                    .font_weight(FontWeight::BOLD)
+                    .text_base()
+                    .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme::text())
                     .child(title),
             )
-            .when_some(detail, |header, detail| {
-                header.child(
-                    div()
-                        .pb_1()
-                        .text_xs()
-                        .text_color(theme::muted())
-                        .child(detail),
-                )
-            })
+            .children(trailing)
             .into_any_element()
     }
 
     fn row(&self, label: impl Into<SharedString>, value: impl Into<SharedString>) -> AnyElement {
         div()
             .w_full()
-            .min_h(px(52.0))
-            .px_4()
+            .min_h(px(44.0))
+            .px_3()
             .flex()
             .items_center()
             .justify_between()
@@ -1222,8 +1212,8 @@ impl RootView {
         div()
             .id(id)
             .w_full()
-            .min_h(px(52.0))
-            .px_4()
+            .min_h(px(44.0))
+            .px_3()
             .flex()
             .items_center()
             .justify_between()
@@ -1299,23 +1289,22 @@ impl RootView {
         let id = model.id.clone();
         let name = model.name.clone();
         div()
-            .h(px(32.0))
+            .h(px(28.0))
             .flex()
             .items_center()
-            .gap_3()
+            .gap_2()
             .text_xs()
-            .font_weight(FontWeight::SEMIBOLD)
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap_1p5()
-                    .text_color(theme::success())
+                    .text_color(theme::muted())
                     .child(
                         svg()
-                            .path("icons/circle-check.svg")
-                            .size(px(14.0))
-                            .text_color(theme::success()),
+                            .path("icons/check.svg")
+                            .size(px(13.0))
+                            .text_color(theme::accent()),
                     )
                     .child("Installed"),
             )
@@ -1324,7 +1313,7 @@ impl RootView {
                     div()
                         .id(SharedString::from(format!("delete-{id}")))
                         .px_2()
-                        .h(px(28.0))
+                        .h(px(24.0))
                         .flex()
                         .items_center()
                         .rounded_md()
@@ -1387,22 +1376,28 @@ impl RootView {
             div()
                 .id(SharedString::from(format!("download-{model_id}")))
                 .flex_shrink_0()
-                .min_w(px(80.0))
-                .h(px(32.0))
-                .px_3()
+                .min_w(px(76.0))
+                // Sizes differ in digit widths, so a fixed width keeps stacked buttons aligned.
+                .when(with_size, |button| button.w(px(128.0)))
+                .h(px(28.0))
+                .px_2p5()
                 .rounded_md()
                 .border_1()
-                .border_color(theme::accent())
-                .bg(theme::accent_dim())
+                .border_color(theme::border())
+                .bg(theme::input())
                 .flex()
                 .items_center()
                 .justify_center()
                 .gap_2()
                 .text_xs()
-                .font_weight(FontWeight::SEMIBOLD)
+                .font_weight(FontWeight::MEDIUM)
                 .text_color(theme::text())
                 .cursor_pointer()
-                .hover(|style| style.bg(theme::hover()))
+                .hover(|style| {
+                    style
+                        .border_color(theme::border_strong())
+                        .bg(theme::hover())
+                })
                 .child(label)
                 .when(progress.is_some(), |button| {
                     button.child(
@@ -1488,9 +1483,9 @@ impl RootView {
         let can_remove = self.settings.routes.len() > 1;
         div()
             .w_full()
-            .min_h(px(58.0))
-            .px_4()
-            .py_2()
+            .min_h(px(44.0))
+            .px_3()
+            .py_1p5()
             .flex()
             .items_center()
             .gap_3()
@@ -1553,7 +1548,7 @@ impl RootView {
                 div()
                     .id(SharedString::from(format!("remove-route-{index}")))
                     .flex_shrink_0()
-                    .size(px(30.0))
+                    .size(px(28.0))
                     .rounded_md()
                     .flex()
                     .items_center()
@@ -1643,8 +1638,8 @@ impl RootView {
     fn mode_control(&self, cx: &Context<Self>) -> AnyElement {
         let routed = self.settings.transcription_mode == TranscriptionMode::Routed;
         div()
-            .w(px(310.0))
-            .h(px(34.0))
+            .w(px(240.0))
+            .h(px(30.0))
             .rounded_md()
             .border_1()
             .border_color(theme::border())
@@ -1659,7 +1654,6 @@ impl RootView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .font_weight(FontWeight::SEMIBOLD)
                     .text_sm()
                     .text_color(if routed {
                         theme::text()
@@ -1667,7 +1661,7 @@ impl RootView {
                         theme::muted()
                     })
                     .bg(if routed {
-                        theme::accent_dim()
+                        theme::selection()
                     } else {
                         theme::input()
                     })
@@ -1690,7 +1684,6 @@ impl RootView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .font_weight(FontWeight::SEMIBOLD)
                     .text_sm()
                     .text_color(if routed {
                         theme::muted()
@@ -1700,7 +1693,7 @@ impl RootView {
                     .bg(if routed {
                         theme::input()
                     } else {
-                        theme::accent_dim()
+                        theme::selection()
                     })
                     .cursor_pointer()
                     .child("Single model")
@@ -1731,9 +1724,9 @@ impl RootView {
         div()
             .id(SharedString::from(format!("permission-{kind:?}")))
             .w_full()
-            .min_h(px(66.0))
-            .px_4()
-            .py_3()
+            .min_h(px(56.0))
+            .px_3()
+            .py_2p5()
             .flex()
             .items_center()
             .justify_between()
@@ -1744,57 +1737,41 @@ impl RootView {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme::text())
-                            .child(title),
-                    )
+                    .child(div().text_sm().text_color(theme::text()).child(title))
                     .child(div().text_xs().text_color(theme::muted()).child(detail)),
             )
             .child(
                 div()
                     .id(SharedString::from(format!("permission-{kind:?}-action")))
-                    .min_w(px(116.0))
-                    .h(px(32.0))
+                    .flex_shrink_0()
+                    .h(px(28.0))
                     .px_3()
                     .rounded_md()
-                    .border_1()
-                    .border_color(if granted {
-                        theme::border()
-                    } else {
-                        theme::accent()
-                    })
-                    .bg(if granted {
-                        theme::input()
-                    } else {
-                        theme::accent_dim()
-                    })
                     .flex()
                     .items_center()
                     .justify_center()
-                    .gap_2()
+                    .gap_1p5()
                     .text_xs()
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .font_weight(FontWeight::MEDIUM)
                     .text_color(if granted {
-                        theme::success()
+                        theme::muted()
                     } else {
-                        theme::text()
+                        theme::background()
                     })
+                    .when(!granted, |button| button.bg(theme::text()))
                     .when(granted, |button| {
                         button.child(
                             svg()
-                                .path("icons/circle-check.svg")
-                                .size(px(14.0))
-                                .text_color(theme::success()),
+                                .path("icons/check.svg")
+                                .size(px(13.0))
+                                .text_color(theme::accent()),
                         )
                     })
                     .child(action)
                     .when(!granted, |button| {
                         button
                             .cursor_pointer()
-                            .hover(|style| style.bg(theme::hover()))
+                            .hover(|style| style.opacity(0.85))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.request_permission(kind, cx);
                             }))
@@ -1848,22 +1825,12 @@ impl RootView {
                     .child(
                         div()
                             .flex()
-                            .items_center()
-                            .gap_2()
-                            .text_sm()
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(theme::accent())
-                            .child("Pyzhscriber"),
-                    )
-                    .child(
-                        div()
-                            .flex()
                             .flex_col()
                             .gap_2()
                             .child(
                                 div()
-                                    .text_2xl()
-                                    .font_weight(FontWeight::BOLD)
+                                    .text_xl()
+                                    .font_weight(FontWeight::SEMIBOLD)
                                     .child(if all_granted {
                                         "You’re ready"
                                     } else {
@@ -1897,7 +1864,6 @@ impl RootView {
         div()
             .flex()
             .flex_col()
-            .child(self.page_header("General", None))
             .child(self.section("Transcription", {
                 let mut rows = vec![
                     self.action_row(
@@ -2265,17 +2231,17 @@ impl RootView {
     {
         div()
             .id(id)
-            .h(px(32.0))
-            .px_3()
+            .h(px(30.0))
+            .px_2p5()
             .rounded_md()
             .border_1()
             .border_color(if active {
-                theme::accent()
+                theme::border_strong()
             } else {
                 theme::border()
             })
             .bg(if active {
-                theme::accent_dim()
+                theme::selection()
             } else {
                 theme::input()
             })
@@ -2283,7 +2249,6 @@ impl RootView {
             .items_center()
             .gap_2()
             .text_xs()
-            .font_weight(FontWeight::MEDIUM)
             .text_color(if active {
                 theme::text()
             } else {
@@ -2297,7 +2262,7 @@ impl RootView {
             .child(label)
             .hover(move |style| {
                 style.bg(if active {
-                    theme::accent_dim()
+                    theme::selection()
                 } else {
                     theme::hover()
                 })
@@ -2329,9 +2294,9 @@ impl RootView {
         div()
             .id(id.clone())
             .track_focus(focus)
-            .h(px(34.0))
+            .h(px(30.0))
             .w_full()
-            .px_3()
+            .px_2p5()
             .rounded_md()
             .border_1()
             .border_color(theme::border())
@@ -2342,7 +2307,7 @@ impl RootView {
             .text_sm()
             .text_color(if empty { theme::muted() } else { theme::text() })
             .cursor(CursorStyle::IBeam)
-            .focus(|style| style.border_color(theme::accent()).bg(theme::accent_dim()))
+            .focus(|style| style.border_color(theme::border_strong()))
             .child(div().flex_1().min_w_0().truncate().child(text))
             .when(!empty, |input| {
                 input.child(
@@ -2432,14 +2397,12 @@ impl RootView {
             div()
                 .id(SharedString::from(format!("model-{}", model.id)))
                 .w_full()
-                .p_4()
-                .rounded_lg()
-                .border_1()
-                .border_color(theme::border())
-                .bg(theme::raised())
+                .px_3()
+                .py_2p5()
+                .border_t_1()
+                .border_color(theme::separator())
                 .flex()
-                .items_start()
-                .justify_between()
+                .items_center()
                 .gap_6()
                 .child(
                     div()
@@ -2447,13 +2410,34 @@ impl RootView {
                         .min_w_0()
                         .flex()
                         .flex_col()
-                        .gap_2()
+                        .gap_1()
                         .child(
                             div()
-                                .text_lg()
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(theme::text())
-                                .child(model.name.clone()),
+                                .flex()
+                                .items_center()
+                                .gap_2p5()
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_sm()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(theme::text())
+                                        .child(model.name.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(theme::muted())
+                                        .child(format!(
+                                            "{} · {} · {} · {}",
+                                            model.architecture,
+                                            model.quant,
+                                            languages,
+                                            display_size(model.size_bytes)
+                                        )),
+                                ),
                         )
                         .child(
                             div()
@@ -2461,44 +2445,43 @@ impl RootView {
                                 .text_color(theme::muted())
                                 .child(model.description.clone()),
                         )
-                        .child(div().text_xs().text_color(theme::muted()).child(format!(
-                            "{}  ·  {}  ·  {}  ·  {}",
-                            model.architecture,
-                            model.quant,
-                            languages,
-                            display_size(model.size_bytes)
-                        )))
-                        .child(
-                            div()
-                                .pt_1()
-                                .flex()
-                                .gap_5()
-                                .child(model_metric("Accuracy", model.accuracy_score))
-                                .child(model_metric("Speed", model.speed_score)),
-                        )
                         .when_some(download_progress, |column, progress| {
                             column.child(
                                 div()
                                     .mt_1()
                                     .w_full()
-                                    .h(px(3.0))
+                                    .h(px(2.0))
                                     .rounded_full()
-                                    .bg(theme::hover())
+                                    .bg(theme::selection())
                                     .child(
                                         div()
                                             .h_full()
                                             .w(relative(progress.clamp(0.0, 1.0)))
                                             .rounded_full()
-                                            .bg(theme::accent()),
+                                            .bg(theme::accent_gradient()),
                                     ),
                             )
                         }),
                 )
                 .child(
-                    div().mt_1().child(
-                        self.download_button(&model.id, false, cx)
-                            .unwrap_or_else(|| self.installed_status(model, cx)),
-                    ),
+                    div()
+                        .flex_shrink_0()
+                        .flex()
+                        .flex_col()
+                        .gap_1p5()
+                        .child(model_metric("Accuracy", model.accuracy_score))
+                        .child(model_metric("Speed", model.speed_score)),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .w(px(132.0))
+                        .flex()
+                        .justify_end()
+                        .child(
+                            self.download_button(&model.id, false, cx)
+                                .unwrap_or_else(|| self.installed_status(model, cx)),
+                        ),
                 )
         };
 
@@ -2506,27 +2489,16 @@ impl RootView {
             .flex()
             .flex_col()
             .child(
-                self.page_header(
-                    "Models",
-                    Some(
-                        if shown == total {
-                            format!("{installed} installed, {total} in catalog")
-                        } else {
-                            format!("{shown} of {total} shown")
-                        }
-                        .into(),
-                    ),
-                ),
-            )
-            .child(
                 div()
-                    .pb_1()
+                    .h(px(36.0))
+                    .px_3()
+                    .mb_4()
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(div().w(px(280.0)).min_w(px(220.0)).child(self.search_field(
+                    .child(div().flex_1().min_w(px(120.0)).child(self.search_field(
                         "model-search".into(),
-                        "Search name or description",
+                        "Search models",
                         &self.model_search,
                         &self.model_search_focus,
                         |this| &mut this.model_search,
@@ -2574,18 +2546,27 @@ impl RootView {
                                 cx.notify();
                             },
                         ),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_xs()
+                            .text_color(theme::muted())
+                            .child(if shown == total {
+                                format!("{installed} installed, {total} in catalog")
+                            } else {
+                                format!("{shown} of {total} shown")
+                            }),
                     ),
             )
             .child(
                 div()
-                    .pt_2()
-                    .pb_4()
                     .flex()
                     .flex_col()
-                    .gap_3()
                     .when(shown == 0, |column| {
                         column.child(
                             div()
+                                .px_3()
                                 .py_8()
                                 .text_sm()
                                 .text_color(theme::muted())
@@ -2593,27 +2574,22 @@ impl RootView {
                         )
                     })
                     .when(!installed_models.is_empty(), |column| {
-                        column
-                            .child(self.model_group_label("Your models"))
-                            .children(installed_models.iter().copied().map(card))
+                        column.child(
+                            div()
+                                .pb_6()
+                                .child(self.section_title("Your models", None))
+                                .children(installed_models.iter().copied().map(card)),
+                        )
                     })
                     .when(!available_models.is_empty(), |column| {
-                        column
-                            .child(self.model_group_label("Available"))
-                            .children(available_models.iter().copied().map(card))
+                        column.child(
+                            div()
+                                .pb_6()
+                                .child(self.section_title("Available", None))
+                                .children(available_models.iter().copied().map(card)),
+                        )
                     }),
             )
-            .into_any_element()
-    }
-
-    fn model_group_label(&self, title: &'static str) -> AnyElement {
-        div()
-            .pt_2()
-            .px_2()
-            .text_xs()
-            .font_weight(FontWeight::MEDIUM)
-            .text_color(theme::muted())
-            .child(title)
             .into_any_element()
     }
 
@@ -2632,7 +2608,6 @@ impl RootView {
         div()
             .flex()
             .flex_col()
-            .child(self.page_header("Audio", None))
             .child(self.section(
                 "Microphone",
                 vec![
@@ -2857,7 +2832,6 @@ impl RootView {
         div()
             .flex()
             .flex_col()
-            .child(self.page_header("Output", None))
             .child(self.section("Text", text_rows))
             .child(self.section("AI cleanup", cleanup_rows))
             .into_any_element()
@@ -2868,24 +2842,27 @@ impl RootView {
             return div()
                 .flex()
                 .flex_col()
-                .child(self.page_header("History", None))
                 .child(
                     div()
-                        .px_2()
-                        .py_4()
+                        .px_3()
+                        .py_2()
                         .text_sm()
                         .text_color(theme::muted())
                         .child("No transcriptions yet."),
                 )
                 .into_any_element();
         }
-        let mut rows = vec![self.tinted_action_row(
-            "clear-history",
-            "Clear history",
-            "Clear",
-            theme::danger(),
-            cx,
-            |_, cx| {
+        let clear = div()
+            .id("clear-history")
+            .h(px(24.0))
+            .px_2()
+            .flex()
+            .items_center()
+            .rounded_md()
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::hover()).text_color(theme::danger()))
+            .child("Clear")
+            .on_click(cx.listener(|_, _, _, cx| {
                 Self::after_modal(
                     cx,
                     || {
@@ -2904,17 +2881,15 @@ impl RootView {
                         cx.notify();
                     },
                 );
-            },
-        )];
-        rows.extend(self.history.iter().map(|entry| {
+            }));
+        let rows = self.history.iter().map(|entry| {
             let text = entry.text.clone();
             let id = entry.id;
             let copied = self.copied_entry == Some(id);
             div()
                 .id(SharedString::from(format!("history-{}", entry.id)))
-                .min_h(px(64.0))
-                .px_4()
-                .py_3()
+                .px_3()
+                .py_2p5()
                 .flex()
                 .flex_col()
                 .gap_1()
@@ -2981,15 +2956,27 @@ impl RootView {
                     cx.notify();
                 }))
                 .into_any_element()
-        }));
+        });
         div()
             .flex()
             .flex_col()
-            .child(self.page_header(
-                "History",
-                Some(format!("{} entries", self.history.len()).into()),
-            ))
-            .child(self.section("Transcriptions", rows))
+            .child(
+                self.section_with(
+                    "Transcriptions",
+                    Some(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_xs()
+                            .text_color(theme::muted())
+                            .child(format!("{} entries", self.history.len()))
+                            .child(clear)
+                            .into_any_element(),
+                    ),
+                    rows.collect(),
+                ),
+            )
             .into_any_element()
     }
 
@@ -3006,7 +2993,6 @@ impl RootView {
         div()
             .flex()
             .flex_col()
-            .child(self.page_header("Advanced", None))
             .child(self.section("Command line", {
                 let mut rows = vec![self.action_row(
                     "install-cli",
@@ -3240,11 +3226,7 @@ pub(crate) struct RecordingOverlay {
 }
 
 impl RecordingOverlay {
-    fn new(
-        controller: Arc<AppController>,
-        status: RuntimeStatus,
-        bubbly: bool,
-    ) -> Self {
+    fn new(controller: Arc<AppController>, status: RuntimeStatus, bubbly: bool) -> Self {
         let now = Instant::now();
         Self {
             status,
@@ -3769,22 +3751,26 @@ impl Render for RootView {
             .flex()
             .child(
                 div()
-                    .w(px(196.0))
+                    .w(px(184.0))
                     .flex_shrink_0()
                     .h_full()
-                    .bg(theme::raised())
+                    .bg(theme::sidebar_gradient())
                     .pt(px(48.0))
                     .pb_4()
                     .border_r_1()
-                    .border_color(theme::border())
+                    .border_color(theme::separator())
                     .flex()
                     .flex_col()
                     .child(
                         div()
-                            .px_4()
-                            .pb_4()
-                            .text_lg()
-                            .font_weight(FontWeight::BOLD)
+                            .px_5()
+                            .pb_3()
+                            .flex()
+                            .items_center()
+                            .gap_2p5()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(brand_mark())
                             .child("Pyzhscriber"),
                     )
                     .child(self.sidebar_item(
@@ -3801,22 +3787,29 @@ impl Render for RootView {
                     .child(div().flex_1())
                     .child(
                         div()
-                            .mx_3()
-                            .pt_3()
-                            .border_t_1()
-                            .border_color(theme::border())
+                            .px_5()
                             .flex()
                             .items_center()
                             .gap_2()
                             .text_xs()
                             .text_color(theme::muted())
-                            .child(div().size(px(7.0)).rounded_full().bg(match self.status {
-                                RuntimeStatus::Idle => theme::success(),
-                                RuntimeStatus::Recording | RuntimeStatus::Error(_) => {
-                                    theme::danger()
-                                }
-                                RuntimeStatus::Transcribing => theme::accent(),
-                            }))
+                            .child({
+                                let color = match self.status {
+                                    RuntimeStatus::Idle => theme::success(),
+                                    RuntimeStatus::Recording | RuntimeStatus::Error(_) => {
+                                        theme::danger()
+                                    }
+                                    RuntimeStatus::Transcribing => theme::accent(),
+                                };
+                                div()
+                                    .size(px(13.0))
+                                    .rounded_full()
+                                    .bg(color.opacity(0.2))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(div().size(px(7.0)).rounded_full().bg(color))
+                            })
                             .child(status_label),
                     ),
             )
@@ -3826,9 +3819,9 @@ impl Render for RootView {
                     .flex_1()
                     .min_w_0()
                     .h_full()
-                    .pt(px(48.0))
-                    .px(px(40.0))
-                    .pb_8()
+                    .pt(px(40.0))
+                    .px(px(24.0))
+                    .pb_4()
                     .overflow_y_scroll()
                     .children(self.error_banner(cx))
                     .child(content),
@@ -3847,12 +3840,11 @@ impl RootView {
         Some(
             div()
                 .mb_4()
-                .px_4()
-                .py_3()
-                .rounded_lg()
+                .px_3()
+                .py_2()
+                .rounded_md()
                 .border_1()
                 .border_color(theme::danger())
-                .bg(theme::raised())
                 .flex()
                 .items_start()
                 .gap_3()
@@ -3916,32 +3908,49 @@ fn paste_method_value(method: PasteMethod) -> &'static str {
     }
 }
 
+/// The app icon in miniature: sound bars that end in a text cursor.
+fn brand_mark() -> impl IntoElement {
+    let heights = [5.0, 11.0, 16.0, 9.0, 13.0];
+    div()
+        .h(px(16.0))
+        .flex()
+        .items_center()
+        .gap(px(2.0))
+        .children(heights.into_iter().enumerate().map(|(index, height)| {
+            div().w(px(2.0)).h(px(height)).rounded_full().bg(mix(
+                theme::accent(),
+                theme::success(),
+                index as f32 / 4.0,
+            ))
+        }))
+        .child(div().ml(px(1.0)).w(px(1.5)).h(px(16.0)).bg(theme::text()))
+}
+
 fn model_metric(label: &'static str, score: f32) -> AnyElement {
     let score = score.clamp(0.0, 1.0);
     div()
-        .w(px(148.0))
         .flex()
         .items_center()
         .gap_2()
         .child(
             div()
-                .w(px(64.0))
+                .w(px(56.0))
                 .text_xs()
                 .text_color(theme::muted())
                 .child(label),
         )
         .child(
             div()
-                .w(px(74.0))
-                .h(px(6.0))
+                .w(px(64.0))
+                .h(px(3.0))
                 .rounded_full()
-                .bg(theme::hover())
+                .bg(theme::selection())
                 .child(
                     div()
                         .h_full()
-                        .w(px(74.0 * score))
+                        .w(px(64.0 * score))
                         .rounded_full()
-                        .bg(theme::accent()),
+                        .bg(theme::accent_gradient()),
                 ),
         )
         .into_any_element()
